@@ -224,6 +224,16 @@ class TurboQuantFullAttentionSpec(FullAttentionSpec):
     def real_page_size_bytes(self) -> int:
         return self.block_size * self.num_kv_heads * self.bytes_per_token_per_head
 
+    def copy_with_new_block_size(self, block_size: int) -> Self:
+        if self.page_size_padded is None:
+            return replace(self, block_size=block_size)
+        ratio = block_size / self.block_size
+        return replace(
+            self,
+            block_size=block_size,
+            page_size_padded=int(self.page_size_padded * ratio),
+        )
+
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         assert all(isinstance(spec, TurboQuantFullAttentionSpec) for spec in specs), (

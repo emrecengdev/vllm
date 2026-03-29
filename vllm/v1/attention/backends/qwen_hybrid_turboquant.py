@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import TurboQuantFullAttentionSpec
 
 from .flash_attn import (
@@ -105,8 +106,14 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         mode = "turbo4"
+        bytes_per_token_per_head: int | None = None
         try:
-            mode = TurboQuantRuntimeConfig.from_current_config().mode
+            vllm_config = get_current_vllm_config()
+            mode = vllm_config.attention_config.turboquant_mode
+            kv_dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
+            bytes_per_token_per_head = (2 * head_size) * torch.empty(
+                [], dtype=kv_dtype
+            ).element_size()
         except AssertionError:
             # Some static shape queries run before vLLM config context exists.
             pass
@@ -118,7 +125,12 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
             dtype=torch.uint8,
             mode=mode,
         )
-        return (num_blocks, block_size, num_kv_heads, spec.bytes_per_token_per_head)
+        return (
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            bytes_per_token_per_head or spec.bytes_per_token_per_head,
+        )
 
     @staticmethod
     def get_kv_cache_stride_order(
@@ -174,20 +186,36 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
 
     def __init__(
         self,
-        kv_cache_spec: AttentionSpec,
-        layer_names: list[str],
-        vllm_config: VllmConfig,
-        device: torch.device,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        alibi_slopes: list[float] | None,
+        sliding_window: int | None,
+        kv_cache_dtype: str,
+        logits_soft_cap: float | None = None,
+        attn_type: AttentionType = AttentionType.DECODER,
+        kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> None:
-        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        if not isinstance(kv_cache_spec, TurboQuantFullAttentionSpec):
-            raise TypeError(
-                "QwenHybridTurboQuantImpl requires TurboQuantFullAttentionSpec."
-            )
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=alibi_slopes,
+            sliding_window=sliding_window,
+            kv_cache_dtype=kv_cache_dtype,
+            logits_soft_cap=logits_soft_cap,
+            attn_type=attn_type,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            sinks=sinks,
+        )
         self.turboquant_config = TurboQuantRuntimeConfig.from_current_config()
-        self.bits = kv_cache_spec.bits
+        self.bits = 4 if self.turboquant_config.mode == "turbo4" else 3
         self.scale_dtype = torch.float16
-        self.head_size_v = kv_cache_spec.head_size_v
+        self.headdim = head_size
+        self.head_size_v = head_size
         if self.turboquant_config.debug_log_stats:
             logger.info(
                 "Initialized %s with mode=%s sparse_v=%s layer_adaptive=%s",

@@ -562,6 +562,12 @@ class Attention(nn.Module, AttentionLayerBase):
                     head_size=self.head_size,
                     head_size_v=self.head_size_v,
                     dtype=torch.uint8,
+                    page_size_padded=(
+                        block_size
+                        * self.num_kv_heads
+                        * (self.head_size + self.head_size_v)
+                        * self.kv_cache_torch_dtype.itemsize
+                    ),
                     mode=vllm_config.attention_config.turboquant_mode,
                 )
             return FullAttentionSpec(
