@@ -40,6 +40,9 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     TurboQuantFullAttentionSpec,
 )
+from vllm.v1.attention.backends.qwen_hybrid_turboquant_utils import (
+    should_use_layer_adaptive_dense_cache,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention import MLAAttention
@@ -556,6 +559,14 @@ class Attention(nn.Module, AttentionLayerBase):
                 vllm_config.attention_config.turboquant_enabled
                 and self.attn_backend.get_name() == "QWEN_HYBRID_TURBOQUANT"
             ):
+                if should_use_layer_adaptive_dense_cache(self.layer_name):
+                    return FullAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        head_size_v=self.head_size_v,
+                        dtype=self.kv_cache_torch_dtype,
+                    )
                 return TurboQuantFullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=self.num_kv_heads,

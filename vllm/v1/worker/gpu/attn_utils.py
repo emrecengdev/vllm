@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    TurboQuantFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
@@ -130,13 +131,23 @@ def _reshape_kv_cache(
             num_blocks = num_blocks_by_layer[layer_name]
 
             attn_backend = attn_backends[layer_name]
-            kv_cache_shape = attn_backend.get_kv_cache_shape(
-                num_blocks,
-                kv_cache_spec.block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                cache_dtype,
-            )
+            if (
+                hasattr(attn_backend, "get_kv_cache_shape_for_spec")
+                and not isinstance(kv_cache_spec, TurboQuantFullAttentionSpec)
+            ):
+                kv_cache_shape = attn_backend.get_kv_cache_shape_for_spec(
+                    num_blocks,
+                    kv_cache_spec,
+                    cache_dtype,
+                )
+            else:
+                kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    num_blocks,
+                    kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                    cache_dtype,
+                )
 
             # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
             try:

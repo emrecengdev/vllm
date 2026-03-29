@@ -8,6 +8,10 @@
 - `turbo4` and `turbo3` both pass multimodal smoke with an image-bearing prompt
   against `Qwen/Qwen3.5-4B`.
 - The backend uses packed TurboQuant K/V storage logic and dequant-on-read.
+- `Sparse V` is wired for decode-time TurboQuant value dequant skipping.
+- Layer-adaptive fallback is wired so the tail layers can keep dense
+  `FullAttentionSpec` KV layout while the rest of the hybrid stack remains
+  TurboQuant-packed.
 - Runtime flags are exposed through `AttentionConfig` and CLI.
 - KV cache config/coordinator/manager now carry heterogeneous physical-pool
   metadata:
@@ -23,16 +27,20 @@
 
 Validation completed on 30 March 2026:
 
-- `pytest tests/v1/attention/test_qwen_hybrid_turboquant.py`
-  - `4 passed`
 - `pytest tests/v1/attention/test_qwen_hybrid_turboquant.py tests/v1/core/test_kv_cache_utils.py`
-  - `54 passed`
+  - `56 passed`
 - text smoke
   - `turbo4`: `llm_init_ok`, `generate_ok`
   - `turbo3`: `llm_init_ok`, `generate_ok`
 - multimodal smoke
   - `turbo4`: `llm_init_ok`, `generate_ok`
   - `turbo3`: `llm_init_ok`, `generate_ok`
+- text smoke with advanced policies enabled
+  - `turbo4 + sparse_v + layer_adaptive`: `llm_init_ok`, `generate_ok`
+  - `turbo3 + sparse_v + layer_adaptive`: `llm_init_ok`, `generate_ok`
+- multimodal smoke with advanced policies enabled
+  - `turbo4 + sparse_v + layer_adaptive`: `llm_init_ok`, `generate_ok`
+  - `turbo3 + sparse_v + layer_adaptive`: `llm_init_ok`, `generate_ok`
 - observed KV capacity deltas after physical packed allocation landed
   - `turbo4` text smoke at `GPU_MEMORY_UTILIZATION=0.6`
     - before: `24,064` tokens
@@ -44,19 +52,13 @@ Validation completed on 30 March 2026:
 ## Current Limitation
 
 The branch now carries the packed physical layout end-to-end for the main
-TurboQuant worker path, but two areas are still not fully hardened:
+TurboQuant worker path, including `Sparse V` and layer-adaptive fallback, but
+two areas are still not fully hardened:
 
-Practically, that means:
-
-- the backend and hybrid scheduler path are stable,
-- text and multimodal execution both work for `turbo4` and `turbo3`,
-- the main worker path now realizes real KV capacity gains from physical packed
-  pages,
-- but connector/offload paths have not yet been revalidated against the new
-  physical pool contract.
-
-So this branch is past the original PoC stage and now demonstrates actual KV
-memory savings, but it is not yet the final production-hardening milestone.
+- connector/offload paths have not yet been revalidated against the new
+  physical pool contract,
+- the public benchmark story is still based on `Qwen/Qwen3.5-4B` smoke rather
+  than a full `Qwen3.5-27B` serving benchmark pack.
 
 ## Publishable State
 
@@ -64,6 +66,7 @@ This branch is already strong enough to show:
 
 - a new `vLLM` attention backend for `Qwen3.5` hybrid models,
 - dual `turbo4` and `turbo3` support,
+- `Sparse V` and layer-adaptive TurboQuant policies,
 - text and multimodal end-to-end smoke execution,
 - heterogeneous physical-pool metadata and scheduler plumbing in the v1 KV
   cache path,
@@ -74,4 +77,3 @@ This branch is already strong enough to show:
 1. Revalidate connector/offload paths against the physical pool contract.
 2. Add real `27B` multimodal launch validation and benchmark tables.
 3. Benchmark OpenAI-server serving defaults on the 24 GB target recipe.
-4. Layer in `Sparse V` and higher-level TurboQuant policies.

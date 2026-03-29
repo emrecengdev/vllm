@@ -5,7 +5,10 @@ from vllm.v1.attention.backends.qwen_hybrid_turboquant import (
     QwenHybridTurboQuantBackend,
     is_qwen_hybrid_turboquant_candidate,
 )
-from vllm.v1.kv_cache_interface import TurboQuantFullAttentionSpec
+from vllm.v1.attention.backends.qwen_hybrid_turboquant_utils import (
+    should_use_layer_adaptive_dense_cache,
+)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, TurboQuantFullAttentionSpec
 
 
 def test_turboquant_full_attention_spec_sizes():
@@ -95,3 +98,42 @@ def test_qwen_hybrid_turboquant_backend_shape_fallback():
     assert shape[1] == 16
     assert shape[2] == 8
     assert shape[3] == 132
+
+
+def test_qwen_hybrid_turboquant_backend_shape_for_spec():
+    turbo_spec = TurboQuantFullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.uint8,
+        mode="turbo4",
+    )
+    dense_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=8,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.float16,
+    )
+
+    turbo_shape = QwenHybridTurboQuantBackend.get_kv_cache_shape_for_spec(7, turbo_spec)
+    dense_shape = QwenHybridTurboQuantBackend.get_kv_cache_shape_for_spec(7, dense_spec)
+
+    assert turbo_shape == (7, 16, 8, 132)
+    assert dense_shape == (2, 7, 16, 8, 128)
+
+
+def test_layer_adaptive_dense_cache_helper(monkeypatch):
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.qwen_hybrid_turboquant_utils.get_current_vllm_config",
+        lambda: SimpleNamespace(
+            attention_config=SimpleNamespace(turboquant_layer_adaptive=True),
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(num_hidden_layers=64)
+            ),
+        ),
+    )
+
+    assert should_use_layer_adaptive_dense_cache("model.layers.56.self_attn") is True
+    assert should_use_layer_adaptive_dense_cache("model.layers.10.self_attn") is False

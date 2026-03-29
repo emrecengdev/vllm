@@ -182,13 +182,23 @@ class KVConnectorModelRunnerMixin:
             return False
 
         attn_backend = attn_group.backend
-        kv_cache_shape = attn_backend.get_kv_cache_shape(
-            1234,
-            kv_cache_spec.block_size,
-            kv_cache_spec.num_kv_heads,
-            kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
-        )
+        if (
+            hasattr(attn_backend, "get_kv_cache_shape_for_spec")
+            and not isinstance(kv_cache_spec, TurboQuantFullAttentionSpec)
+        ):
+            kv_cache_shape = attn_backend.get_kv_cache_shape_for_spec(
+                1234,
+                kv_cache_spec,
+                cache_dtype_str=cache_dtype,
+            )
+        else:
+            kv_cache_shape = attn_backend.get_kv_cache_shape(
+                1234,
+                kv_cache_spec.block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str=cache_dtype,
+            )
 
         try:
             kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(
@@ -254,13 +264,23 @@ class KVConnectorModelRunnerMixin:
         kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
         attn_backend = attn_group.backend
-        kv_cache_shape = attn_backend.get_kv_cache_shape(
-            kernel_num_blocks,
-            kernel_block_size,
-            kv_cache_spec.num_kv_heads,
-            kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
-        )
+        if (
+            hasattr(attn_backend, "get_kv_cache_shape_for_spec")
+            and not isinstance(kv_cache_spec, TurboQuantFullAttentionSpec)
+        ):
+            kv_cache_shape = attn_backend.get_kv_cache_shape_for_spec(
+                kernel_num_blocks,
+                kv_cache_spec,
+                cache_dtype_str=cache_dtype,
+            )
+        else:
+            kv_cache_shape = attn_backend.get_kv_cache_shape(
+                kernel_num_blocks,
+                kernel_block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str=cache_dtype,
+            )
 
         # prepend a num_layers dimension into the shape
         kv_cache_shape = (num_layers,) + kv_cache_shape

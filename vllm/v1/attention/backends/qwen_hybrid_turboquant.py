@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionType
-from vllm.v1.kv_cache_interface import TurboQuantFullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, TurboQuantFullAttentionSpec
 
 from .flash_attn import (
     FlashAttentionBackend,
@@ -31,8 +31,10 @@ from .flash_attn import (
     cascade_attention,
     flash_attn_varlen_func,
 )
+from .qwen_hybrid_turboquant_utils import should_use_layer_adaptive_dense_cache
 
 logger = init_logger(__name__)
+SPARSE_V_ALPHA_THRESHOLD = 1e-6
 
 
 @dataclass
@@ -127,6 +129,31 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
             spec.bytes_per_token_per_head,
         )
 
+    @classmethod
+    def get_kv_cache_shape_for_spec(
+        cls,
+        num_blocks: int,
+        kv_cache_spec,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if isinstance(kv_cache_spec, TurboQuantFullAttentionSpec):
+            return cls.get_kv_cache_shape(
+                num_blocks,
+                kv_cache_spec.block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str,
+            )
+        if isinstance(kv_cache_spec, FullAttentionSpec):
+            return FlashAttentionBackend.get_kv_cache_shape(
+                num_blocks,
+                kv_cache_spec.block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str,
+            )
+        raise TypeError(f"Unsupported KV cache spec for TurboQuant backend: {type(kv_cache_spec)}")
+
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
@@ -219,6 +246,11 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
                 self.turboquant_config.sparse_v,
                 self.turboquant_config.layer_adaptive,
             )
+
+    def _uses_dense_layer_fallback(self, layer: torch.nn.Module) -> bool:
+        return should_use_layer_adaptive_dense_cache(
+            getattr(layer, "layer_name", None)
+        )
 
     @property
     def _quant_min(self) -> int:
@@ -393,6 +425,133 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
         ).contiguous()
         return key_cache, value_cache, local_block_table
 
+    def _gather_local_key_cache(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_blocks = block_table >= 0
+        if not valid_blocks.any():
+            empty_k = torch.empty(
+                (0, kv_cache.shape[1], kv_cache.shape[2], self.headdim),
+                dtype=dtype,
+                device=kv_cache.device,
+            )
+            return (
+                empty_k,
+                torch.empty((0,), dtype=torch.int64, device=kv_cache.device),
+                torch.empty_like(block_table),
+            )
+        used_block_ids = torch.unique(block_table[valid_blocks].to(torch.int64), sorted=True)
+        local_block_table = torch.full_like(block_table, -1)
+        local_block_table[valid_blocks] = torch.searchsorted(
+            used_block_ids,
+            block_table[valid_blocks].to(torch.int64),
+        ).to(block_table.dtype)
+        packed_cache = kv_cache.index_select(0, used_block_ids)
+        key_cache = self._dequantize_tensor(
+            packed_cache[..., : self.packed_k_bytes],
+            packed_cache[..., self._k_scale_start : self._k_scale_start + self.scale_bytes],
+            self.headdim,
+            dtype,
+        ).contiguous()
+        return key_cache, used_block_ids, local_block_table
+
+    def _dequantize_selected_values(
+        self,
+        kv_cache: torch.Tensor,
+        used_block_ids: torch.Tensor,
+        local_block_ids: torch.Tensor,
+        token_positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        packed_blocks = kv_cache.index_select(0, used_block_ids.index_select(0, local_block_ids))
+        token_offsets = token_positions.to(torch.int64)
+        packed_values = packed_blocks[
+            torch.arange(token_offsets.shape[0], device=kv_cache.device),
+            token_offsets,
+        ]
+        return self._dequantize_tensor(
+            packed_values[
+                ..., self._value_start : self._value_start + self.packed_v_bytes
+            ],
+            packed_values[
+                ..., self._v_scale_start : self._v_scale_start + self.scale_bytes
+            ],
+            self.head_size_v,
+            dtype,
+        ).contiguous()
+
+    def _expand_kv_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.num_queries_per_kv == 1:
+            return tensor
+        return tensor.repeat_interleave(self.num_queries_per_kv, dim=-2)
+
+    def _forward_sparse_value_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        key_cache, used_block_ids, local_block_table = self._gather_local_key_cache(
+            kv_cache,
+            attn_metadata.block_table,
+            query.dtype,
+        )
+        for req_idx in range(attn_metadata.query_start_loc.shape[0] - 1):
+            start = int(attn_metadata.query_start_loc[req_idx])
+            end = int(attn_metadata.query_start_loc[req_idx + 1])
+            if end <= start:
+                continue
+            if end - start != 1:
+                raise NotImplementedError(
+                    "Sparse V decode path only supports one query token per request."
+                )
+
+            seq_len = int(attn_metadata.seq_lens[req_idx])
+            local_blocks = local_block_table[req_idx]
+            local_blocks = local_blocks[local_blocks >= 0].to(torch.int64)
+            if local_blocks.numel() == 0 or seq_len == 0:
+                output[start:end].zero_()
+                continue
+
+            key_tokens = key_cache.index_select(0, local_blocks).reshape(
+                -1, self.num_kv_heads, self.headdim
+            )[:seq_len]
+            key_tokens = self._expand_kv_heads(key_tokens)
+            q = query[start]
+            attn_logits = torch.einsum("hd,thd->ht", q, key_tokens) * self.scale
+            attn_probs = torch.softmax(attn_logits.float(), dim=-1).to(query.dtype)
+            keep_mask = attn_probs.amax(dim=0) >= SPARSE_V_ALPHA_THRESHOLD
+            if not keep_mask.any():
+                keep_mask[attn_probs.argmax(dim=-1)[0]] = True
+
+            kept_positions = torch.nonzero(keep_mask, as_tuple=False).flatten()
+            selected_block_ids = torch.div(
+                kept_positions,
+                kv_cache.shape[1],
+                rounding_mode="floor",
+            )
+            token_offsets = torch.remainder(kept_positions, kv_cache.shape[1])
+            value_tokens = self._dequantize_selected_values(
+                kv_cache,
+                used_block_ids,
+                local_blocks.index_select(0, selected_block_ids),
+                token_offsets,
+                query.dtype,
+            )
+            value_tokens = self._expand_kv_heads(value_tokens)
+            out = torch.einsum(
+                "ht,thd->hd",
+                attn_probs[:, keep_mask],
+                value_tokens,
+            )
+            output[start] = out.to(output.dtype)
+
+        return output
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -405,6 +564,18 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._uses_dense_layer_fallback(layer):
+            return super().forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
         assert output is not None, "Output tensor must be provided."
         assert self.vllm_flash_attn_version is not None, (
             "FlashAttention version not detected."
@@ -418,6 +589,17 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
         if self.dcp_world_size > 1:
             raise NotImplementedError(
                 "TurboQuant backend does not yet support decode context parallelism."
+            )
+        if (
+            self.turboquant_config.sparse_v
+            and not attn_metadata.use_cascade
+            and attn_metadata.max_query_len == 1
+        ):
+            return self._forward_sparse_value_decode(
+                query,
+                kv_cache,
+                attn_metadata,
+                output,
             )
 
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -496,6 +678,10 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        if self._uses_dense_layer_fallback(layer):
+            return super().do_kv_cache_update(
+                layer, key, value, kv_cache, slot_mapping
+            )
         if slot_mapping.numel() == 0:
             return
         valid = slot_mapping >= 0

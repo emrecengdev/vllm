@@ -9,6 +9,10 @@ from PIL import Image
 from vllm import LLM, SamplingParams
 
 
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").lower() in {"1", "true", "yes", "on"}
+
+
 def build_image() -> Image.Image:
     image = Image.new("RGB", (96, 96), color=(240, 240, 240))
     for x in range(24, 72):
@@ -22,20 +26,23 @@ def main() -> None:
     gpu_memory_utilization = float(
         os.environ.get("TURBOQUANT_GPU_MEMORY_UTILIZATION", "0.5")
     )
+    attention_config = {
+        "turboquant_enabled": True,
+        "turboquant_mode": mode,
+        "turboquant_sparse_v": env_flag("TURBOQUANT_SPARSE_V"),
+        "turboquant_layer_adaptive": env_flag("TURBOQUANT_LAYER_ADAPTIVE"),
+    }
     llm = LLM(
         model="Qwen/Qwen3.5-4B",
         trust_remote_code=True,
         load_format="dummy",
         max_model_len=512,
         gpu_memory_utilization=gpu_memory_utilization,
-        attention_config={
-            "turboquant_enabled": True,
-            "turboquant_mode": mode,
-        },
+        attention_config=attention_config,
         limit_mm_per_prompt={"image": 1},
         enforce_eager=True,
     )
-    print("llm_init_ok", type(llm).__name__, mode)
+    print("llm_init_ok", type(llm).__name__, mode, attention_config)
 
     tokenizer = llm.get_tokenizer()
     chat_prompt = tokenizer.apply_chat_template(
