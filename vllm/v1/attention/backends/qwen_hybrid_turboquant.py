@@ -106,14 +106,9 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         mode = "turbo4"
-        bytes_per_token_per_head: int | None = None
         try:
             vllm_config = get_current_vllm_config()
             mode = vllm_config.attention_config.turboquant_mode
-            kv_dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
-            bytes_per_token_per_head = (2 * head_size) * torch.empty(
-                [], dtype=kv_dtype
-            ).element_size()
         except AssertionError:
             # Some static shape queries run before vLLM config context exists.
             pass
@@ -129,7 +124,7 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
             num_blocks,
             block_size,
             num_kv_heads,
-            bytes_per_token_per_head or spec.bytes_per_token_per_head,
+            spec.bytes_per_token_per_head,
         )
 
     @staticmethod

@@ -6562,6 +6562,11 @@ class GPUModelRunner(
         """
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
+        num_blocks_by_layer = {
+            layer_name: kv_cache_tensor.num_blocks
+            for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors
+            for layer_name in kv_cache_tensor.shared_by
+        }
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             attn_backend = group.backend
@@ -6573,8 +6578,7 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-                num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                num_blocks = num_blocks_by_layer[layer_name]
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (

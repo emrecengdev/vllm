@@ -114,6 +114,11 @@ def _reshape_kv_cache(
     cache_dtype: str,
 ) -> dict[str, torch.Tensor]:
     kv_caches: dict[str, torch.Tensor] = {}
+    num_blocks_by_layer = {
+        layer_name: kv_cache_tensor.num_blocks
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors
+        for layer_name in kv_cache_tensor.shared_by
+    }
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
         for layer_name in kv_cache_group_spec.layer_names:
             kv_cache_spec = kv_cache_group_spec.kv_cache_spec
@@ -122,8 +127,7 @@ def _reshape_kv_cache(
             assert isinstance(kv_cache_spec, AttentionSpec)
 
             raw_tensor = kv_cache_raw_tensors[layer_name]
-            assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
-            num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+            num_blocks = num_blocks_by_layer[layer_name]
 
             attn_backend = attn_backends[layer_name]
             kv_cache_shape = attn_backend.get_kv_cache_shape(

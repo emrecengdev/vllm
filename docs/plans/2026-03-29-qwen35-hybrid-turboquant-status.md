@@ -16,6 +16,8 @@
   - `KVCacheTensor.physical_pool_id`
 - The v1 scheduler admission path now checks capacity per physical pool instead
   of assuming one global block pool.
+- Worker-side KV tensor allocation and reshape now use physical packed page
+  sizes for the TurboQuant pool instead of the old logical padded size.
 
 ## What We Verified
 
@@ -31,22 +33,30 @@ Validation completed on 30 March 2026:
 - multimodal smoke
   - `turbo4`: `llm_init_ok`, `generate_ok`
   - `turbo3`: `llm_init_ok`, `generate_ok`
+- observed KV capacity deltas after physical packed allocation landed
+  - `turbo4` text smoke at `GPU_MEMORY_UTILIZATION=0.6`
+    - before: `24,064` tokens
+    - after: `27,136` tokens
+  - `turbo3` text smoke at `GPU_MEMORY_UTILIZATION=0.5`
+    - before: `8,192` tokens
+    - after: `10,240` tokens
 
 ## Current Limitation
 
-The branch now has heterogeneous-pool scheduling metadata, but worker-side raw
-tensor allocation still follows the logical hybrid page geometry.
+The branch now carries the packed physical layout end-to-end for the main
+TurboQuant worker path, but two areas are still not fully hardened:
 
 Practically, that means:
 
 - the backend and hybrid scheduler path are stable,
 - text and multimodal execution both work for `turbo4` and `turbo3`,
-- per-pool block accounting exists in the core allocator path,
-- but the final worker allocation path does not yet allocate raw KV tensors
-  using the packed physical page size.
+- the main worker path now realizes real KV capacity gains from physical packed
+  pages,
+- but connector/offload paths have not yet been revalidated against the new
+  physical pool contract.
 
-So this branch is stronger than the original single-pool PoC, but it is still
-not the final "full packed memory win" milestone.
+So this branch is past the original PoC stage and now demonstrates actual KV
+memory savings, but it is not yet the final production-hardening milestone.
 
 ## Publishable State
 
@@ -56,12 +66,12 @@ This branch is already strong enough to show:
 - dual `turbo4` and `turbo3` support,
 - text and multimodal end-to-end smoke execution,
 - heterogeneous physical-pool metadata and scheduler plumbing in the v1 KV
-  cache path.
+  cache path,
+- real packed-page KV capacity gains in the worker allocation path.
 
 ## Remaining Engineering Work
 
-1. Teach worker-side raw KV tensor allocation and reshape paths to use
-   physical packed page sizes instead of only logical padded page sizes.
-2. Revalidate connector/offload paths once worker allocation is pool-aware.
-3. Add real `27B` multimodal launch validation and benchmark tables.
-4. Measure true memory deltas once packed physical allocation lands.
+1. Revalidate connector/offload paths against the physical pool contract.
+2. Add real `27B` multimodal launch validation and benchmark tables.
+3. Benchmark OpenAI-server serving defaults on the 24 GB target recipe.
+4. Layer in `Sparse V` and higher-level TurboQuant policies.

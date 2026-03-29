@@ -1809,18 +1809,18 @@ def test_get_kv_cache_config_heterogeneous_physical_pools():
         available_memory,
     )
 
-    assert kv_cache_config.num_blocks == 2
-    assert kv_cache_config.num_blocks_by_pool == (2, 2)
+    assert kv_cache_config.num_blocks == 3
+    assert kv_cache_config.num_blocks_by_pool == (3, 3)
     assert kv_cache_config.kv_cache_tensors == [
         KVCacheTensor(
-            size=turbo_spec.page_size_bytes * 2,
-            num_blocks=2,
+            size=turbo_spec.physical_page_size_bytes * 3,
+            num_blocks=3,
             shared_by=["layer_turbo"],
             physical_pool_id=0,
         ),
         KVCacheTensor(
-            size=dense_spec.page_size_bytes * 2,
-            num_blocks=2,
+            size=dense_spec.page_size_bytes * 3,
+            num_blocks=3,
             shared_by=["layer_dense"],
             physical_pool_id=1,
         ),

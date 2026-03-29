@@ -890,19 +890,25 @@ def _pool_memory_usage_bytes(
             for spec in per_layer_specs.values()
         )
         memory_usage = sum(
-            spec.page_size_bytes * blocks_needed for spec in per_layer_specs.values()
+            spec.physical_page_size_bytes * blocks_needed
+            for spec in per_layer_specs.values()
         )
         return memory_usage, len(per_layer_specs), blocks_needed
 
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
+    page_size = get_uniform_page_size([group.kv_cache_spec for group in kv_cache_groups])
+    physical_page_size = next(
+        iter(group.kv_cache_spec.physical_page_size_bytes for group in kv_cache_groups)
     )
     blocks_needed = sum(
         cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
         for group in kv_cache_groups
     )
-    return group_size * page_size * blocks_needed, group_size, blocks_needed
+    return (
+        group_size * physical_page_size * blocks_needed,
+        group_size,
+        blocks_needed,
+    )
 
 
 def _get_kv_cache_config_from_groups_heterogeneous_pools(
@@ -962,7 +968,8 @@ def _get_kv_cache_config_from_groups_heterogeneous_pools(
             for layer_name in groups[0].layer_names:
                 kv_cache_tensors.append(
                     KVCacheTensor(
-                        size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
+                        size=per_layer_specs[layer_name].physical_page_size_bytes
+                        * num_blocks,
                         num_blocks=num_blocks,
                         shared_by=[layer_name],
                         physical_pool_id=pool_id,
@@ -971,7 +978,9 @@ def _get_kv_cache_config_from_groups_heterogeneous_pools(
             continue
 
         group_size = max(len(group.layer_names) for group in groups)
-        page_size = get_uniform_page_size([group.kv_cache_spec for group in groups])
+        page_size = next(
+            iter(group.kv_cache_spec.physical_page_size_bytes for group in groups)
+        )
         for i in range(group_size):
             shared_by = []
             for group in groups:
