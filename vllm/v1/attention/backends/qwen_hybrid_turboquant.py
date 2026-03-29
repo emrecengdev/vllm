@@ -104,14 +104,19 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        config = TurboQuantRuntimeConfig.from_current_config()
+        mode = "turbo4"
+        try:
+            mode = TurboQuantRuntimeConfig.from_current_config().mode
+        except AssertionError:
+            # Some static shape queries run before vLLM config context exists.
+            pass
         spec = TurboQuantFullAttentionSpec(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             head_size_v=head_size,
             dtype=torch.uint8,
-            mode=config.mode,
+            mode=mode,
         )
         return (num_blocks, block_size, num_kv_heads, spec.bytes_per_token_per_head)
 
