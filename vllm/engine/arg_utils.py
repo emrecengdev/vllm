@@ -805,6 +805,23 @@ class EngineArgs:
         attention_group.add_argument(
             "--attention-backend", **attention_kwargs["backend"]
         )
+        attention_group.add_argument(
+            "--turboquant-enabled", **attention_kwargs["turboquant_enabled"]
+        )
+        attention_group.add_argument(
+            "--turboquant-mode", **attention_kwargs["turboquant_mode"]
+        )
+        attention_group.add_argument(
+            "--turboquant-sparse-v", **attention_kwargs["turboquant_sparse_v"]
+        )
+        attention_group.add_argument(
+            "--turboquant-layer-adaptive",
+            **attention_kwargs["turboquant_layer_adaptive"],
+        )
+        attention_group.add_argument(
+            "--turboquant-debug-log-stats",
+            **attention_kwargs["turboquant_debug_log_stats"],
+        )
 
         # Structured outputs arguments
         structured_outputs_kwargs = get_kwargs(StructuredOutputsConfig)

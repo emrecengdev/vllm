@@ -46,6 +46,21 @@ class AttentionConfig:
     use_prefill_query_quantization: bool = False
     """If set, quantize query for attention in prefill."""
 
+    turboquant_enabled: bool = False
+    """Enable the experimental TurboQuant path for supported hybrid models."""
+
+    turboquant_mode: Literal["turbo4", "turbo3"] = "turbo4"
+    """TurboQuant preset to apply. turbo4 is the default balanced mode."""
+
+    turboquant_sparse_v: bool = False
+    """Enable Sparse-V style decode optimization when available."""
+
+    turboquant_layer_adaptive: bool = False
+    """Enable layer-adaptive precision policies for TurboQuant."""
+
+    turboquant_debug_log_stats: bool = False
+    """Emit debug logging and counters for TurboQuant runtime decisions."""
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs
