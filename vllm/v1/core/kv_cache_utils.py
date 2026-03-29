@@ -854,6 +854,146 @@ def get_num_blocks(
     return num_blocks
 
 
+def _use_heterogeneous_hybrid_pools(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> bool:
+    if vllm_config.cache_config.enable_prefix_caching:
+        return False
+    if not vllm_config.attention_config.turboquant_enabled:
+        return False
+    physical_page_sizes = {
+        group.kv_cache_spec.physical_page_size_bytes for group in kv_cache_groups
+    }
+    return len(physical_page_sizes) > 1
+
+
+def _pool_memory_usage_bytes(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> tuple[int, int, int]:
+    """
+    Returns:
+        A tuple of (memory_usage_bytes, group_size, blocks_needed)
+    """
+    if not kv_cache_groups:
+        return 0, 0, 0
+
+    if len(kv_cache_groups) == 1 and isinstance(
+        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    ):
+        per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+        blocks_needed = max(
+            cdiv(
+                spec.max_memory_usage_bytes(vllm_config),
+                spec.page_size_bytes,
+            )
+            for spec in per_layer_specs.values()
+        )
+        memory_usage = sum(
+            spec.page_size_bytes * blocks_needed for spec in per_layer_specs.values()
+        )
+        return memory_usage, len(per_layer_specs), blocks_needed
+
+    group_size = max(len(group.layer_names) for group in kv_cache_groups)
+    page_size = get_uniform_page_size(
+        [group.kv_cache_spec for group in kv_cache_groups]
+    )
+    blocks_needed = sum(
+        cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
+        for group in kv_cache_groups
+    )
+    return group_size * page_size * blocks_needed, group_size, blocks_needed
+
+
+def _get_kv_cache_config_from_groups_heterogeneous_pools(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    pool_groups: dict[int, list[KVCacheGroupSpec]] = defaultdict(list)
+    physical_page_size_to_pool_id: dict[int, int] = {}
+    updated_groups: list[KVCacheGroupSpec] = []
+
+    for group in kv_cache_groups:
+        physical_page_size = group.kv_cache_spec.physical_page_size_bytes
+        pool_id = physical_page_size_to_pool_id.setdefault(
+            physical_page_size, len(physical_page_size_to_pool_id)
+        )
+        updated_group = KVCacheGroupSpec(
+            layer_names=group.layer_names,
+            kv_cache_spec=group.kv_cache_spec,
+            physical_pool_id=pool_id,
+        )
+        updated_groups.append(updated_group)
+        pool_groups[pool_id].append(updated_group)
+
+    pool_shapes: dict[int, tuple[int, int, int]] = {}
+    total_memory_usage = 0
+    for pool_id, groups in pool_groups.items():
+        memory_usage, group_size, blocks_needed = _pool_memory_usage_bytes(
+            vllm_config, groups
+        )
+        pool_shapes[pool_id] = (memory_usage, group_size, blocks_needed)
+        total_memory_usage += memory_usage
+
+    if total_memory_usage <= 0:
+        return KVCacheConfig(
+            num_blocks=1,
+            kv_cache_tensors=[],
+            kv_cache_groups=updated_groups,
+            num_blocks_by_pool=tuple(1 for _ in pool_groups),
+        )
+
+    concurrency = available_memory / total_memory_usage
+    num_blocks_by_pool = [0] * len(pool_groups)
+    kv_cache_tensors: list[KVCacheTensor] = []
+
+    for pool_id in range(len(pool_groups)):
+        _, _, blocks_needed = pool_shapes[pool_id]
+        num_blocks = int(blocks_needed * concurrency)
+        num_blocks = may_override_num_blocks(vllm_config, max(num_blocks, 0))
+        num_blocks_by_pool[pool_id] = num_blocks
+
+        groups = pool_groups[pool_id]
+        if len(groups) == 1 and isinstance(
+            groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+        ):
+            per_layer_specs = groups[0].kv_cache_spec.kv_cache_specs
+            for layer_name in groups[0].layer_names:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
+                        num_blocks=num_blocks,
+                        shared_by=[layer_name],
+                        physical_pool_id=pool_id,
+                    )
+                )
+            continue
+
+        group_size = max(len(group.layer_names) for group in groups)
+        page_size = get_uniform_page_size([group.kv_cache_spec for group in groups])
+        for i in range(group_size):
+            shared_by = []
+            for group in groups:
+                if i < len(group.layer_names):
+                    shared_by.append(group.layer_names[i])
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=page_size * num_blocks,
+                    num_blocks=num_blocks,
+                    shared_by=shared_by,
+                    physical_pool_id=pool_id,
+                )
+            )
+
+    return KVCacheConfig(
+        num_blocks=max(num_blocks_by_pool, default=0),
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=updated_groups,
+        num_blocks_by_pool=tuple(num_blocks_by_pool),
+    )
+
+
 def get_uniform_page_size(kv_cache_specs: Iterable[KVCacheSpec]) -> int:
     """
     Get the page size of the KV cache.
@@ -1103,6 +1243,11 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    if _use_heterogeneous_hybrid_pools(vllm_config, kv_cache_groups):
+        return _get_kv_cache_config_from_groups_heterogeneous_pools(
+            vllm_config, kv_cache_groups, available_memory
+        )
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1118,6 +1263,7 @@ def get_kv_cache_config_from_groups(
         kv_cache_tensors = [
             KVCacheTensor(
                 size=per_layer_specs[layer_name].page_size_bytes * num_blocks,
+                num_blocks=num_blocks,
                 shared_by=[layer_name],
             )
             for layer_name in kv_cache_groups[0].layer_names
@@ -1147,7 +1293,11 @@ def get_kv_cache_config_from_groups(
                 if i < len(kv_cache_groups[j].layer_names):
                     shared_by.append(kv_cache_groups[j].layer_names[i])
             kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                KVCacheTensor(
+                    size=page_size * num_blocks,
+                    num_blocks=num_blocks,
+                    shared_by=shared_by,
+                )
             )
 
     return KVCacheConfig(
@@ -1342,6 +1492,20 @@ def _max_memory_usage_bytes_from_groups(
     """
     if not kv_cache_groups:
         return 0
+
+    if _use_heterogeneous_hybrid_pools(vllm_config, kv_cache_groups):
+        pool_groups: dict[int, list[KVCacheGroupSpec]] = defaultdict(list)
+        physical_page_size_to_pool_id: dict[int, int] = {}
+        for group in kv_cache_groups:
+            physical_page_size = group.kv_cache_spec.physical_page_size_bytes
+            pool_id = physical_page_size_to_pool_id.setdefault(
+                physical_page_size, len(physical_page_size_to_pool_id)
+            )
+            pool_groups[pool_id].append(group)
+        return sum(
+            _pool_memory_usage_bytes(vllm_config, groups)[0]
+            for groups in pool_groups.values()
+        )
 
     # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
     if len(kv_cache_groups) == 1 and isinstance(
@@ -1599,17 +1763,42 @@ def get_kv_cache_configs(
     # Change the num_blocks of each rank to the smallest among all ranks.
     # We also need to shrink the tensor size proportionally to avoid
     # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
-    )
-    for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
+    if any(kv_cache_config.num_blocks_by_pool for kv_cache_config in kv_cache_configs):
+        min_num_blocks_by_pool = tuple(
+            min(
+                cfg.num_blocks_by_pool[pool_id]  # type: ignore[index]
+                for cfg in kv_cache_configs
+            )
+            for pool_id in range(len(kv_cache_configs[0].num_blocks_by_pool or ()))
+        )
+        for kv_cache_config in kv_cache_configs:
+            old_num_blocks_by_pool = kv_cache_config.num_blocks_by_pool
+            assert old_num_blocks_by_pool is not None
+            kv_cache_config.num_blocks_by_pool = min_num_blocks_by_pool
+            kv_cache_config.num_blocks = max(min_num_blocks_by_pool, default=0)
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            for tensor in kv_cache_config.kv_cache_tensors:
+                num_blocks_old = old_num_blocks_by_pool[tensor.physical_pool_id]
+                num_blocks_new = min_num_blocks_by_pool[tensor.physical_pool_id]
+                assert tensor.size % max(num_blocks_old, 1) == 0
+                tensor.size = tensor.size // max(num_blocks_old, 1) * num_blocks_new
+                tensor.num_blocks = num_blocks_new
+
+        if len(kv_cache_configs[0].kv_cache_groups) > 0:
+            _report_kv_cache_config(vllm_config, kv_cache_configs[0])
+    else:
+        min_num_blocks = min(
+            kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+        )
+        for kv_cache_config in kv_cache_configs:
+            num_blocks_old = kv_cache_config.num_blocks
+            kv_cache_config.num_blocks = min_num_blocks
+
+            # Shrink tensor size proportionally
+            for tensor in kv_cache_config.kv_cache_tensors:
+                assert tensor.size % num_blocks_old == 0
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
+                tensor.num_blocks = min_num_blocks
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

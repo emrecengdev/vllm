@@ -4,65 +4,64 @@
 
 - `QWEN_HYBRID_TURBOQUANT` is wired through backend selection for multimodal
   `Qwen3.5` hybrid models.
-- Both `turbo4` and `turbo3` pass the dummy-engine smoke path with
-  `Qwen/Qwen3.5-4B`.
+- `turbo4` and `turbo3` both pass text smoke with `Qwen/Qwen3.5-4B`.
+- `turbo4` and `turbo3` both pass multimodal smoke with an image-bearing prompt
+  against `Qwen/Qwen3.5-4B`.
 - The backend uses packed TurboQuant K/V storage logic and dequant-on-read.
 - Runtime flags are exposed through `AttentionConfig` and CLI.
-- Worker-side allocation now distinguishes logical hybrid page size from the
-  physical packed TurboQuant page size.
+- KV cache config/coordinator/manager now carry heterogeneous physical-pool
+  metadata:
+  - `KVCacheConfig.num_blocks_by_pool`
+  - `KVCacheGroupSpec.physical_pool_id`
+  - `KVCacheTensor.physical_pool_id`
+- The v1 scheduler admission path now checks capacity per physical pool instead
+  of assuming one global block pool.
+
+## What We Verified
+
+Validation completed on 30 March 2026:
+
+- `pytest tests/v1/attention/test_qwen_hybrid_turboquant.py`
+  - `4 passed`
+- `pytest tests/v1/attention/test_qwen_hybrid_turboquant.py tests/v1/core/test_kv_cache_utils.py`
+  - `54 passed`
+- text smoke
+  - `turbo4`: `llm_init_ok`, `generate_ok`
+  - `turbo3`: `llm_init_ok`, `generate_ok`
+- multimodal smoke
+  - `turbo4`: `llm_init_ok`, `generate_ok`
+  - `turbo3`: `llm_init_ok`, `generate_ok`
 
 ## Current Limitation
 
-The current design still keeps the hybrid scheduler and coordinator on the
-existing single-pool semantics. Logical page sizes remain padded where hybrid
-grouping needs them, while worker allocation and reshape use packed physical
-page sizes.
+The branch now has heterogeneous-pool scheduling metadata, but worker-side raw
+tensor allocation still follows the logical hybrid page geometry.
 
-This means:
+Practically, that means:
 
-- backend selection and execution work end-to-end,
-- `turbo3` and `turbo4` are both runnable,
-- packed allocation is active in the worker path,
-- but connector/offload coverage and broader benchmark validation are still
-  incomplete.
+- the backend and hybrid scheduler path are stable,
+- text and multimodal execution both work for `turbo4` and `turbo3`,
+- per-pool block accounting exists in the core allocator path,
+- but the final worker allocation path does not yet allocate raw KV tensors
+  using the packed physical page size.
 
-## What We Verified Next
-
-We validated a direct split between:
-
-- logical hybrid page size used by the scheduler/grouping code, and
-- physical packed page size used by raw tensor allocation.
-
-The working version uses the physical page size for KV tensor sizing and worker
-reshape while preserving the logical page size for the hybrid grouping logic.
-That keeps the current `BlockPool` contract intact and restores stable smoke
-execution for both modes.
-
-## Correct Next Design
-
-The next milestone is broader system validation rather than another backend-side
-packing tweak:
-
-1. Keep the current backend path as the stable working PoC.
-2. Validate connector and offload code paths against the physical page-size
-   split.
-3. Add deeper measurements for memory, throughput, and multimodal prompts.
-4. Decide whether a later multi-pool hybrid coordinator is still worth the
-   added complexity.
+So this branch is stronger than the original single-pool PoC, but it is still
+not the final "full packed memory win" milestone.
 
 ## Publishable State
 
 This branch is already strong enough to show:
 
-- a new `vLLM` attention backend,
-- hybrid-model detection for `Qwen3.5`,
-- dual TurboQuant mode support,
-- successful end-to-end smoke execution through the v1 engine.
+- a new `vLLM` attention backend for `Qwen3.5` hybrid models,
+- dual `turbo4` and `turbo3` support,
+- text and multimodal end-to-end smoke execution,
+- heterogeneous physical-pool metadata and scheduler plumbing in the v1 KV
+  cache path.
 
 ## Remaining Engineering Work
 
-1. Validate connector/offload paths against the physical page-size split.
-2. Add real 27B multimodal launch validation and benchmark tables.
-3. Extend beyond text smoke into image-bearing prompts and service-level tests.
-4. Revisit a multi-pool hybrid coordinator only if the current split leaves
-   measurable headroom on long-context workloads.
+1. Teach worker-side raw KV tensor allocation and reshape paths to use
+   physical packed page sizes instead of only logical padded page sizes.
+2. Revalidate connector/offload paths once worker allocation is pool-aware.
+3. Add real `27B` multimodal launch validation and benchmark tables.
+4. Measure true memory deltas once packed physical allocation lands.

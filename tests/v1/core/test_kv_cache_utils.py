@@ -46,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    TurboQuantFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
@@ -137,6 +138,24 @@ def new_sliding_window_spec(
         dtype=dtype,
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
+    )
+
+
+def new_turboquant_spec(
+    block_size=16,
+    num_kv_heads=2,
+    head_size=64,
+    dtype=torch.float32,
+    page_size_padded=None,
+    mode="turbo4",
+):
+    return TurboQuantFullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+        page_size_padded=page_size_padded,
+        mode=mode,
     )
 
 
@@ -1765,6 +1784,51 @@ def test_get_kv_cache_config_one_worker():
         ],
         kv_cache_groups=[KVCacheGroupSpec(["layer_1", "layer_2"], new_kv_cache_spec())],
     )
+
+
+def test_get_kv_cache_config_heterogeneous_physical_pools():
+    model_config = ModelConfig(max_model_len=32)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.enable_prefix_caching = False
+    vllm_config.attention_config.turboquant_enabled = True
+
+    dense_spec = new_kv_cache_spec()
+    turbo_spec = new_turboquant_spec(page_size_padded=dense_spec.page_size_bytes)
+    kv_cache_groups = [
+        KVCacheGroupSpec(["layer_turbo"], turbo_spec),
+        KVCacheGroupSpec(["layer_dense"], dense_spec),
+    ]
+    available_memory = (
+        turbo_spec.max_memory_usage_bytes(vllm_config)
+        + dense_spec.max_memory_usage_bytes(vllm_config)
+    )
+
+    kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        kv_cache_groups,
+        available_memory,
+    )
+
+    assert kv_cache_config.num_blocks == 2
+    assert kv_cache_config.num_blocks_by_pool == (2, 2)
+    assert kv_cache_config.kv_cache_tensors == [
+        KVCacheTensor(
+            size=turbo_spec.page_size_bytes * 2,
+            num_blocks=2,
+            shared_by=["layer_turbo"],
+            physical_pool_id=0,
+        ),
+        KVCacheTensor(
+            size=dense_spec.page_size_bytes * 2,
+            num_blocks=2,
+            shared_by=["layer_dense"],
+            physical_pool_id=1,
+        ),
+    ]
+    assert kv_cache_config.kv_cache_groups == [
+        KVCacheGroupSpec(["layer_turbo"], turbo_spec, physical_pool_id=0),
+        KVCacheGroupSpec(["layer_dense"], dense_spec, physical_pool_id=1),
+    ]
 
 
 def test_get_kv_cache_configs_attention_free():

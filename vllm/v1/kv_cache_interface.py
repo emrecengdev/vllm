@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from math import prod
 
 import torch
@@ -567,7 +567,11 @@ class KVCacheTensor:
     """
 
     size: int  # size of the KV cache tensor in bytes
-    shared_by: list[str]  # layer names that share the same KV cache tensor
+    num_blocks: int = field(default=0, compare=False)
+    # number of blocks addressable in this tensor
+    shared_by: list[str] = field(default_factory=list)
+    # layer names that share the same KV cache tensor
+    physical_pool_id: int = 0  # block-pool used to allocate block ids for it
 
 
 @dataclass
@@ -581,6 +585,8 @@ class KVCacheGroupSpec:
     layer_names: list[str]
     # The KV cache spec of this manager layer
     kv_cache_spec: KVCacheSpec
+    # Physical block pool used by this group.
+    physical_pool_id: int = 0
 
 
 @dataclass
@@ -601,6 +607,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    num_blocks_by_pool: tuple[int, ...] | None = None
+    """Optional per-physical-pool block counts for heterogeneous layouts."""
 
     @property
     def has_mamba_layers(self) -> bool:
