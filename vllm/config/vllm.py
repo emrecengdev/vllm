@@ -690,6 +690,35 @@ class VllmConfig:
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
             self.parallel_config.is_moe_model = self.model_config.is_moe
+            if self.attention_config.turboquant_enabled:
+                from vllm.v1.attention.backends.qwen_hybrid_turboquant import (
+                    is_qwen_hybrid_turboquant_candidate,
+                )
+                from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+                if not is_qwen_hybrid_turboquant_candidate(self):
+                    raise ValueError(
+                        "TurboQuant is currently wired only for Qwen3.5 hybrid "
+                        "multimodal models in this fork."
+                    )
+                if self.attention_config.backend is None:
+                    self.attention_config.backend = (
+                        AttentionBackendEnum.QWEN_HYBRID_TURBOQUANT
+                    )
+                    logger.info_once(
+                        "Enabled %s backend for TurboQuant mode=%s.",
+                        self.attention_config.backend.name,
+                        self.attention_config.turboquant_mode,
+                        scope="local",
+                    )
+                elif (
+                    self.attention_config.backend
+                    != AttentionBackendEnum.QWEN_HYBRID_TURBOQUANT
+                ):
+                    raise ValueError(
+                        "turboquant_enabled requires "
+                        "attention_backend=QWEN_HYBRID_TURBOQUANT or auto."
+                    )
 
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)

@@ -83,6 +83,41 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
     def supports_mm_prefix(cls) -> bool:
         return True
 
+    @classmethod
+    def validate_configuration(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        use_per_head_quant_scales: bool,
+        device_capability,
+        attn_type: str,
+    ) -> list[str]:
+        invalid_reasons = super().validate_configuration(
+            head_size=head_size,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            block_size=block_size,
+            use_mla=use_mla,
+            has_sink=has_sink,
+            use_sparse=use_sparse,
+            use_mm_prefix=use_mm_prefix,
+            use_per_head_quant_scales=use_per_head_quant_scales,
+            device_capability=device_capability,
+            attn_type=attn_type,
+        )
+        vllm_config = get_current_vllm_config()
+        if not TurboQuantRuntimeConfig.from_current_config().enabled:
+            invalid_reasons.append("turboquant_enabled is false")
+        if not is_qwen_hybrid_turboquant_candidate(vllm_config):
+            invalid_reasons.append("model is not a supported Qwen3.5 hybrid multimodal candidate")
+        return invalid_reasons
+
 
 class QwenHybridTurboQuantImpl(FlashAttentionImpl):
     """Phase-0 implementation.
