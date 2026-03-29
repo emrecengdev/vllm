@@ -30,8 +30,17 @@
 #include <cuda_runtime.h>
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
-namespace cde = cuda::device::experimental;
+
+#if defined(__has_include)
+#if __has_include(<cuda/ptx>)
+#include <cuda/ptx>
+#define VLLM_HAS_CUDA_PTX_NS 1
+#endif
+#endif
+
+#if defined(VLLM_HAS_CUDA_PTX_NS)
 namespace ptx = cuda::ptx;
+#endif
 
 #define gpuErrChk(ans)                    \
   {                                       \
@@ -208,7 +217,11 @@ __global__ __launch_bounds__(384, 1) void gpt_oss_router_gemm_kernel(
       init(&bar_act_ready[i], 1);
       init(&bar_data_consumed[i], 32);
     }
+    #if defined(VLLM_HAS_CUDA_PTX_NS)
     ptx::fence_proxy_async(ptx::space_shared);
+    #else
+    __threadfence_block();
+    #endif
     asm volatile("prefetch.tensormap [%0];"
                  :
                  : "l"(reinterpret_cast<uint64_t>(&weight_map))

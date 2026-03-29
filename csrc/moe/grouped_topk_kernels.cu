@@ -44,6 +44,23 @@ static constexpr int DefaultMaxNumTopExperts = 8;
 static constexpr int MaxSupportedTopExperts = 22;
 static constexpr int MaxNumTopGroups = 4;
 
+template <typename To, typename From>
+__forceinline__ __device__ To convert_score_dtype(From value) {
+  return static_cast<To>(value);
+}
+
+template <>
+__forceinline__ __device__ half convert_score_dtype<half, __nv_bfloat16>(
+    __nv_bfloat16 value) {
+  return __float2half(__bfloat162float(value));
+}
+
+template <>
+__forceinline__ __device__ __nv_bfloat16
+convert_score_dtype<__nv_bfloat16, half>(half value) {
+  return __float2bfloat16(__half2float(value));
+}
+
 namespace warp_topk {
 
 template <int size, typename T>
@@ -478,7 +495,7 @@ __device__ void topk_with_k2(T* output, T const* input, BiasT const* bias,
   if (num_experts_per_group > WARP_SIZE) {
     for (int i = lane_id; i < num_experts_per_group; i += WARP_SIZE) {
       T value = apply_scoring<SF>(input[i]);
-      value = value + static_cast<T>(bias[i]);
+      value = value + convert_score_dtype<T>(bias[i]);
 
       if (value > largest) {
         second_largest = largest;
@@ -490,7 +507,7 @@ __device__ void topk_with_k2(T* output, T const* input, BiasT const* bias,
   } else {
     for (int i = lane_id; i < num_experts_per_group; i += WARP_SIZE) {
       T value = apply_scoring<SF>(input[i]);
-      value = value + static_cast<T>(bias[i]);
+      value = value + convert_score_dtype<T>(bias[i]);
       largest = value;
     }
   }
@@ -632,7 +649,7 @@ __global__ void grouped_topk_fused_kernel(
         T input = scores_token[idx];
         if (is_finite(input)) {
           T score = apply_scoring<SF>(input);
-          cand = score + static_cast<T>(bias[idx]);
+          cand = score + convert_score_dtype<T>(bias[idx]);
         }
       }
       expert_sel.add(cand, idx);
