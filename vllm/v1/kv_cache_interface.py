@@ -35,6 +35,17 @@ class KVCacheSpec:
         """
         raise NotImplementedError
 
+    @property
+    def physical_page_size_bytes(self) -> int:
+        """
+        The physical storage size of a page in bytes.
+
+        This may differ from `page_size_bytes` when the logical page size used
+        by the hybrid cache manager is padded to satisfy grouping/layout
+        constraints while the actual storage is packed more tightly.
+        """
+        return self.page_size_bytes
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
@@ -223,6 +234,10 @@ class TurboQuantFullAttentionSpec(FullAttentionSpec):
     @property
     def real_page_size_bytes(self) -> int:
         return self.block_size * self.num_kv_heads * self.bytes_per_token_per_head
+
+    @property
+    def physical_page_size_bytes(self) -> int:
+        return self.real_page_size_bytes
 
     def copy_with_new_block_size(self, block_size: int) -> Self:
         if self.page_size_padded is None:
@@ -469,6 +484,12 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    @property
+    def physical_page_size_bytes(self) -> int:
+        return sum(
+            spec.physical_page_size_bytes for spec in self.kv_cache_specs.values()
+        )
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(
