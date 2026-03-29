@@ -303,6 +303,26 @@ class cmake_build_ext(build_ext):
             self.configure(ext)
             targets.append(target_name(ext.name))
 
+        requested_targets = envs.VLLM_CMAKE_TARGETS
+        if requested_targets:
+            requested = {
+                target.strip()
+                for target in requested_targets.split(",")
+                if target.strip()
+            }
+            unknown = sorted(requested.difference(targets))
+            if unknown:
+                raise RuntimeError(
+                    "Unknown VLLM_CMAKE_TARGETS entries: "
+                    f"{', '.join(unknown)}. Available targets: "
+                    f"{', '.join(sorted(targets))}"
+                )
+            targets = [target for target in targets if target in requested]
+            logger.info(
+                "Restricting CMake build targets via VLLM_CMAKE_TARGETS=%s",
+                ",".join(targets),
+            )
+
         num_jobs, _ = self.compute_num_jobs()
 
         build_args = [

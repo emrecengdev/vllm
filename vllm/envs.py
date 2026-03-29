@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
+    VLLM_CMAKE_TARGETS: str | None = None
     VLLM_USE_PRECOMPILED: bool = False
     VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX: bool = False
     VLLM_DOCKER_BUILD_CONTEXT: bool = False
@@ -507,6 +508,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default this is 1.
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
     "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
+    # Comma-separated subset of CMake targets to build during setup.py.
+    # Example: "_C,cumem_allocator,triton_kernels"
+    "VLLM_CMAKE_TARGETS": lambda: os.getenv("VLLM_CMAKE_TARGETS", None),
     # If set, vllm will use precompiled binaries (*.so)
     "VLLM_USE_PRECOMPILED": lambda: os.environ.get("VLLM_USE_PRECOMPILED", "")
     .strip()
@@ -1741,6 +1745,7 @@ def compile_factors() -> dict[str, object]:
 
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        "VLLM_CMAKE_TARGETS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
