@@ -16,9 +16,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--load-format", default="dummy")
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--disable-custom-all-reduce", action="store_true")
+    parser.add_argument("--sparse-v", action="store_true")
+    parser.add_argument("--layer-adaptive", action="store_true")
     return parser.parse_args()
 
 
@@ -31,10 +35,14 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         load_format=args.load_format,
         max_model_len=args.max_model_len,
+        tensor_parallel_size=args.tensor_parallel_size,
+        disable_custom_all_reduce=args.disable_custom_all_reduce,
         gpu_memory_utilization=args.gpu_memory_utilization,
         attention_config={
             "turboquant_enabled": True,
             "turboquant_mode": args.mode,
+            "turboquant_sparse_v": args.sparse_v,
+            "turboquant_layer_adaptive": args.layer_adaptive,
         },
         enforce_eager=True,
     )
@@ -53,8 +61,12 @@ def main() -> None:
     tok_per_s = token_count / gen_elapsed if gen_elapsed > 0 else 0.0
 
     print(f"mode={args.mode}")
+    print(f"sparse_v={args.sparse_v}")
+    print(f"layer_adaptive={args.layer_adaptive}")
     print(f"model={args.model}")
     print(f"load_format={args.load_format}")
+    print(f"tensor_parallel_size={args.tensor_parallel_size}")
+    print(f"disable_custom_all_reduce={args.disable_custom_all_reduce}")
     print(f"init_seconds={init_elapsed:.3f}")
     print(f"generate_seconds={gen_elapsed:.3f}")
     print(f"generated_tokens={token_count}")

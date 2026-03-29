@@ -129,6 +129,8 @@ def _reshape_kv_cache(
 
             raw_tensor = kv_cache_raw_tensors[layer_name]
             num_blocks = num_blocks_by_layer[layer_name]
+            if num_blocks <= 0:
+                num_blocks = raw_tensor.numel() // kv_cache_spec.physical_page_size_bytes
 
             attn_backend = attn_backends[layer_name]
             if (
@@ -151,7 +153,15 @@ def _reshape_kv_cache(
 
             # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
             try:
-                kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                if (
+                    hasattr(attn_backend, "get_kv_cache_stride_order_for_spec")
+                    and not isinstance(kv_cache_spec, TurboQuantFullAttentionSpec)
+                ):
+                    kv_cache_stride_order = attn_backend.get_kv_cache_stride_order_for_spec(
+                        kv_cache_spec
+                    )
+                else:
+                    kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                 assert len(kv_cache_stride_order) == len(kv_cache_shape)
             except (AttributeError, NotImplementedError):
                 kv_cache_stride_order = tuple(range(len(kv_cache_shape)))

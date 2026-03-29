@@ -6580,6 +6580,10 @@ class GPUModelRunner(
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
                 num_blocks = num_blocks_by_layer[layer_name]
+                if num_blocks <= 0:
+                    num_blocks = (
+                        raw_tensor.numel() // kv_cache_spec.physical_page_size_bytes
+                    )
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
                     num_blocks_per_kv_block = (
@@ -6606,7 +6610,21 @@ class GPUModelRunner(
                         )
                     dtype = kv_cache_spec.dtype
                     try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                        if (
+                            hasattr(attn_backend, "get_kv_cache_stride_order_for_spec")
+                            and not isinstance(
+                                kv_cache_spec, TurboQuantFullAttentionSpec
+                            )
+                        ):
+                            kv_cache_stride_order = (
+                                attn_backend.get_kv_cache_stride_order_for_spec(
+                                    kv_cache_spec
+                                )
+                            )
+                        else:
+                            kv_cache_stride_order = (
+                                attn_backend.get_kv_cache_stride_order()
+                            )
                         assert len(kv_cache_stride_order) == len(kv_cache_shape)
                     except (AttributeError, NotImplementedError):
                         kv_cache_stride_order = tuple(range(len(kv_cache_shape)))

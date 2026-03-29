@@ -16,7 +16,12 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
-from .utils import input_guard, is_amd, is_tma_supported
+from .utils import (
+    FLA_GDN_CONSERVATIVE_AUTOTUNE,
+    input_guard,
+    is_amd,
+    is_tma_supported,
+)
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
 ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32x3"]
@@ -24,14 +29,20 @@ assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
     f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 )
 
-
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
+SOLVE_TRIL_AUTOTUNE_CONFIGS = (
+    [triton.Config({}, num_warps=4, num_stages=3)]
+    if FLA_GDN_CONSERVATIVE_AUTOTUNE
+    else [
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4, 5]
-    ],
+    ]
+)
+
+
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.autotune(
+    configs=SOLVE_TRIL_AUTOTUNE_CONFIGS,
     key=["BT"],
 )
 @triton.jit(do_not_specialize=["T"])
@@ -102,11 +113,7 @@ def solve_tril_16x16_kernel(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-    ],
+    configs=SOLVE_TRIL_AUTOTUNE_CONFIGS,
     key=["H", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])

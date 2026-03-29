@@ -73,9 +73,34 @@ __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, QuantizationArgs] | None]
+_SUPPORTED_CT_QUANTIZATION_ARG_FIELDS = frozenset(QuantizationArgs.model_fields)
+_ATTN_HEAD_QUANTIZATION_STRATEGY = getattr(
+    QuantizationStrategy, "ATTN_HEAD", "attn_head"
+)
 
 
 class CompressedTensorsConfig(QuantizationConfig):
+    @staticmethod
+    def _sanitize_quantization_args_config(
+        quant_args: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if not quant_args:
+            return {}
+
+        sanitized = {
+            key: value
+            for key, value in quant_args.items()
+            if key in _SUPPORTED_CT_QUANTIZATION_ARG_FIELDS
+        }
+
+        dropped = sorted(set(quant_args) - set(sanitized))
+        if dropped:
+            logger.info_once(
+                "Dropping unsupported compressed-tensors quantization args: %s",
+                ", ".join(dropped),
+            )
+        return sanitized
+
     def __init__(
         self,
         target_scheme_map: dict[str, Any],
@@ -289,7 +314,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             for target in targets:
                 target_scheme_map[target] = {}
                 target_scheme_map[target]["weights"] = QuantizationArgs.model_validate(
-                    quant_config.get("weights")
+                    cls._sanitize_quantization_args_config(quant_config.get("weights"))
                 )
 
                 target_scheme_map[target]["input_activations"] = None
@@ -317,7 +342,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                     else:
                         target_scheme_map[target]["input_activations"] = (
                             QuantizationArgs.model_validate(
-                                quant_config.get("input_activations")
+                                cls._sanitize_quantization_args_config(
+                                    quant_config.get("input_activations")
+                                )
                             )
                         )
         return target_scheme_map
@@ -1015,7 +1042,7 @@ class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
         # - q_scale is partitioned over query heads.
         # - k/v_scale is partitioned over kv heads when total_kv_heads >= tp_size,
         #   and replicated when total_kv_heads < tp_size.
-        if strategy == QuantizationStrategy.ATTN_HEAD:
+        if strategy == _ATTN_HEAD_QUANTIZATION_STRATEGY:
 
             def _tp_aware_loader(
                 param: torch.Tensor,

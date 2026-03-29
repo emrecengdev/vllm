@@ -48,6 +48,23 @@ Validation completed on 30 March 2026:
   - `turbo3` text smoke at `GPU_MEMORY_UTILIZATION=0.5`
     - before: `8,192` tokens
     - after: `10,240` tokens
+- real single-`3090` `27B` validation with `Kbenkhaled/Qwen3.5-27B-NVFP4`
+  - text smoke
+    - `turbo4 + sparse_v + layer_adaptive`
+    - `GPU_MEMORY_UTILIZATION=0.90`
+    - `max_model_len=512`
+    - `llm_init_ok`, `generate_ok`
+  - multimodal smoke
+    - `turbo4 + sparse_v + layer_adaptive`
+    - `TURBOQUANT_GPU_MEMORY_UTILIZATION=0.90`
+    - `max_model_len=512`
+    - `llm_init_ok`, `generate_ok`
+  - branch-local compatibility fixes required for this path
+    - compressed-tensors config sanitization for `scale_dtype` / `zp_dtype`
+    - fallback for older `QuantizationStrategy` enums without `ATTN_HEAD`
+    - conservative FLA/GDN Triton autotune on Ampere
+    - process-global GDN prefill warmup deduplication to avoid per-layer
+      startup amplification
 
 ## Current Limitation
 
@@ -57,8 +74,8 @@ two areas are still not fully hardened:
 
 - connector/offload paths have not yet been revalidated against the new
   physical pool contract,
-- the public benchmark story is still based on `Qwen/Qwen3.5-4B` smoke rather
-  than a full `Qwen3.5-27B` serving benchmark pack.
+- the public benchmark story still needs a cleaner `27B` benchmark pack and
+  OpenAI-server numbers beyond smoke coverage.
 
 ## Publishable State
 
@@ -75,5 +92,5 @@ This branch is already strong enough to show:
 ## Remaining Engineering Work
 
 1. Revalidate connector/offload paths against the physical pool contract.
-2. Add real `27B` multimodal launch validation and benchmark tables.
+2. Add benchmark tables for the validated single-`3090` `27B NVFP4` recipe.
 3. Benchmark OpenAI-server serving defaults on the 24 GB target recipe.

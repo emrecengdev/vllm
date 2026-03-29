@@ -16,10 +16,26 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_GDN_FIX_BT, check_shared_mem, is_nvidia_hopper
+from .utils import (
+    FLA_GDN_CONSERVATIVE_AUTOTUNE,
+    FLA_GDN_FIX_BT,
+    check_shared_mem,
+    is_nvidia_hopper,
+)
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+CHUNK_O_AUTOTUNE_CONFIGS = (
+    [triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3)]
+    if FLA_GDN_CONSERVATIVE_AUTOTUNE
+    else [
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in BKV_LIST
+        for BV in BKV_LIST
+        for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ]
+)
 
 
 @triton.heuristics(
@@ -29,13 +45,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+    configs=CHUNK_O_AUTOTUNE_CONFIGS,
     key=["H", "K", "V", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])

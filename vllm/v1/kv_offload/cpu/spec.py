@@ -26,15 +26,23 @@ class CPUOffloadingSpec(OffloadingSpec):
 
         # calculate kv_bytes_per_offloaded_block
         assert kv_cache_config is not None
-        page_sizes = {
-            kv_cache_group.kv_cache_spec.page_size_bytes
-            for kv_cache_group in kv_cache_config.kv_cache_groups
-        }
-        assert len(page_sizes) == 1
-        page_size_bytes = page_sizes.pop()
+        if len(kv_cache_config.kv_cache_groups) != 1:
+            raise NotImplementedError(
+                "CPU offloading currently supports a single KV cache group only. "
+                "Hybrid Qwen/TurboQuant layouts with multiple KV cache groups "
+                "must disable offloading for now."
+            )
+        if not kv_cache_config.kv_cache_tensors:
+            raise ValueError("CPU offloading requires at least one KV cache tensor.")
+        if any(tensor.num_blocks <= 0 for tensor in kv_cache_config.kv_cache_tensors):
+            raise ValueError(
+                "CPU offloading requires initialized KV cache tensor block counts."
+            )
+        page_size_bytes = sum(
+            tensor.size // tensor.num_blocks for tensor in kv_cache_config.kv_cache_tensors
+        )
         kv_bytes_per_block = (
             page_size_bytes
-            * len(kv_cache_config.kv_cache_tensors)
             * vllm_config.parallel_config.world_size
         )
 

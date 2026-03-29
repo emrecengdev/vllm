@@ -14,6 +14,18 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
+from .utils import FLA_GDN_CONSERVATIVE_AUTOTUNE
+
+CHUNK_SCALED_DOT_KKT_AUTOTUNE_CONFIGS = (
+    [triton.Config({"BK": 64}, num_warps=4, num_stages=3)]
+    if FLA_GDN_CONSERVATIVE_AUTOTUNE
+    else [
+        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ]
+)
 
 
 @triton.heuristics(
@@ -23,12 +35,7 @@ from .op import exp
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=CHUNK_SCALED_DOT_KKT_AUTOTUNE_CONFIGS,
     key=["H", "K", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])

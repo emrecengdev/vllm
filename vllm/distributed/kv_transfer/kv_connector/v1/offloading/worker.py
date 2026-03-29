@@ -22,6 +22,7 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     MambaSpec,
+    TurboQuantFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.spec import (
@@ -110,12 +111,26 @@ class OffloadingConnectorWorker:
                     assert layer_kv_cache.storage_offset() == 0
 
                     # get the logical dimension for num_blocks
-                    test_shape = attn_backends[layer_name].get_kv_cache_shape(
-                        num_blocks=1234,
-                        block_size=16,
-                        num_kv_heads=1,
-                        head_size=256,
-                    )
+                    attn_backend = attn_backends[layer_name]
+                    if (
+                        hasattr(attn_backend, "get_kv_cache_shape_for_spec")
+                        and not isinstance(
+                            layer_kv_cache_spec, TurboQuantFullAttentionSpec
+                        )
+                    ):
+                        test_shape = attn_backend.get_kv_cache_shape_for_spec(
+                            1234,
+                            layer_kv_cache_spec,
+                            cache_dtype_str="auto",
+                        )
+                    else:
+                        test_shape = attn_backend.get_kv_cache_shape(
+                            num_blocks=1234,
+                            block_size=layer_kv_cache_spec.block_size,
+                            num_kv_heads=layer_kv_cache_spec.num_kv_heads,
+                            head_size=layer_kv_cache_spec.head_size,
+                            cache_dtype_str="auto",
+                        )
                     num_blocks_logical_dim = test_shape.index(1234)
 
                     # sort the logical dimensions by stride (high to low)
@@ -203,35 +218,51 @@ class OffloadingConnectorWorker:
 
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
-        for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
-            tensor_layer_names = kv_cache_tensor.shared_by
+        if self.spec.kv_cache_config.kv_cache_tensors:
+            for kv_cache_tensor in self.spec.kv_cache_config.kv_cache_tensors:
+                tensor_layer_names = kv_cache_tensor.shared_by
 
-            # verify all layers in the group reference the exact same tensors
-            assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
-            assert (
-                len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
-                == 1
-            )
-            assert (
-                len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
-            )
-
-            # pick the first layer to represent the group
-            first_layer_name = tensor_layer_names[0]
-            for tensor in tensors_per_block[first_layer_name]:
-                block_tensors.append(
-                    CanonicalKVCacheTensor(
-                        tensor=tensor,
-                        page_size_bytes=page_size_bytes[first_layer_name],
-                    )
+                # verify all layers in the group reference the exact same tensors
+                assert len({len(tensors_per_block[n]) for n in tensor_layer_names}) == 1
+                assert (
+                    len({tensors_per_block[n][0].data_ptr() for n in tensor_layer_names})
+                    == 1
+                )
+                assert (
+                    len({tensors_per_block[n][0].stride() for n in tensor_layer_names}) == 1
                 )
 
-                curr_tensor_idx = len(block_tensors) - 1
-                for layer_name in tensor_layer_names:
+                # pick the first layer to represent the group
+                first_layer_name = tensor_layer_names[0]
+                for tensor in tensors_per_block[first_layer_name]:
+                    block_tensors.append(
+                        CanonicalKVCacheTensor(
+                            tensor=tensor,
+                            page_size_bytes=page_size_bytes[first_layer_name],
+                        )
+                    )
+
+                    curr_tensor_idx = len(block_tensors) - 1
+                    for layer_name in tensor_layer_names:
+                        block_data_refs[layer_name].append(
+                            CanonicalKVCacheRef(
+                                tensor_idx=curr_tensor_idx,
+                                page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            )
+                        )
+        else:
+            for layer_name, tensors in tensors_per_block.items():
+                for tensor in tensors:
+                    block_tensors.append(
+                        CanonicalKVCacheTensor(
+                            tensor=tensor,
+                            page_size_bytes=page_size_bytes[layer_name],
+                        )
+                    )
                     block_data_refs[layer_name].append(
                         CanonicalKVCacheRef(
-                            tensor_idx=curr_tensor_idx,
-                            page_size_bytes=(unpadded_page_size_bytes[layer_name]),
+                            tensor_idx=len(block_tensors) - 1,
+                            page_size_bytes=unpadded_page_size_bytes[layer_name],
                         )
                     )
 

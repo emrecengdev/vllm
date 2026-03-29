@@ -163,6 +163,22 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
         return (0, 1, 2, 3)
 
     @classmethod
+    def get_kv_cache_stride_order_for_spec(
+        cls,
+        kv_cache_spec,
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if isinstance(kv_cache_spec, TurboQuantFullAttentionSpec):
+            return cls.get_kv_cache_stride_order(include_num_layers_dimension)
+        if isinstance(kv_cache_spec, FullAttentionSpec):
+            return FlashAttentionBackend.get_kv_cache_stride_order(
+                include_num_layers_dimension
+            )
+        raise TypeError(
+            f"Unsupported KV cache spec for TurboQuant backend: {type(kv_cache_spec)}"
+        )
+
+    @classmethod
     def validate_configuration(
         cls,
         head_size: int,

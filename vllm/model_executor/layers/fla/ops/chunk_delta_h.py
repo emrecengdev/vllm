@@ -14,9 +14,19 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp
-from .utils import use_cuda_graph
+from .utils import FLA_GDN_CONSERVATIVE_AUTOTUNE, use_cuda_graph
 
 NUM_WARPS = [2, 4, 8, 16]
+CHUNK_DELTA_H_AUTOTUNE_CONFIGS = (
+    [triton.Config({"BV": 64}, num_warps=4, num_stages=3)]
+    if FLA_GDN_CONSERVATIVE_AUTOTUNE
+    else [
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [2, 3, 4]
+        for BV in [32, 64]
+    ]
+)
 
 
 @triton.heuristics(
@@ -30,12 +40,7 @@ NUM_WARPS = [2, 4, 8, 16]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
-    ],
+    configs=CHUNK_DELTA_H_AUTOTUNE_CONFIGS,
     key=["H", "K", "V", "BT"],
     use_cuda_graph=use_cuda_graph,
 )

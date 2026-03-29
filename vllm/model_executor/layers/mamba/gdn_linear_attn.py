@@ -58,6 +58,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
+_GDN_PREFILL_WARMUP_SIGNATURES: set[tuple] = set()
 
 
 def fi_chunk_gated_delta_rule(
@@ -591,9 +592,20 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         which has fixed kernel parameters (no autotuning), so only the
         prefill (chunked) path needs warming up.
         """
-        if hasattr(self, "_prefill_kernels_warmed_up"):
+        warmup_signature = (
+            str(mixed_qkv.device),
+            mixed_qkv.dtype,
+            self.num_k_heads // self.tp_size,
+            self.num_v_heads // self.tp_size,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.chunk_gated_delta_rule.__class__.__name__,
+            bool(envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE),
+        )
+
+        if warmup_signature in _GDN_PREFILL_WARMUP_SIGNATURES:
             return
-        self._prefill_kernels_warmed_up = True
+        _GDN_PREFILL_WARMUP_SIGNATURES.add(warmup_signature)
 
         device = mixed_qkv.device
         dtype = mixed_qkv.dtype

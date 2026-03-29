@@ -12,7 +12,9 @@ from compressed_tensors.quantization import QuantizationType
 from tests.models.utils import check_logprobs_close
 from vllm.model_executor.layers.fused_moe import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+    _ATTN_HEAD_QUANTIZATION_STRATEGY,
     CompressedTensorsLinearMethod,
+    CompressedTensorsConfig,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A8Fp8,
     CompressedTensorsW4A16Fp4,
@@ -45,6 +47,39 @@ ROCM_TRITON_SCALED_MM_SUPPORTED_INT8_MODEL = [
     "nm-testing/tinyllama-oneshot-w8a8-dynamic-token-v2",
     "nm-testing/tinyllama-oneshot-w8a8-channel-dynamic-token-v2",
 ]
+
+
+def test_compressed_tensors_sanitize_quantization_args_drops_unknown_fields():
+    quant_args = {
+        "num_bits": 4,
+        "type": "float",
+        "strategy": "tensor_group",
+        "group_size": 16,
+        "symmetric": True,
+        "dynamic": False,
+        "observer": "memoryless_minmax",
+        "observer_kwargs": {},
+        "block_structure": None,
+        "actorder": None,
+        "scale_dtype": "torch.float8_e4m3fn",
+        "zp_dtype": None,
+    }
+
+    sanitized = CompressedTensorsConfig._sanitize_quantization_args_config(
+        quant_args
+    )
+
+    assert "scale_dtype" not in sanitized
+    assert "zp_dtype" not in sanitized
+    assert sanitized["num_bits"] == 4
+    assert sanitized["strategy"] == "tensor_group"
+
+
+def test_compressed_tensors_attn_head_strategy_fallback_is_string_compatible():
+    assert _ATTN_HEAD_QUANTIZATION_STRATEGY in (
+        "attn_head",
+        getattr(type(_ATTN_HEAD_QUANTIZATION_STRATEGY), "ATTN_HEAD", "attn_head"),
+    )
 
 
 @pytest.fixture(scope="function", autouse=True)

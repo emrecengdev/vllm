@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
+import importlib.util
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    TurboQuantFullAttentionSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.spec import (
@@ -38,9 +40,10 @@ if current_platform.is_cuda():
     ATTN_BACKENDS = [
         "FLASH_ATTN",
         "FLEX_ATTENTION",
-        "FLASHINFER",
         "TRITON_ATTN",
     ]
+    if importlib.util.find_spec("flashinfer") is not None:
+        ATTN_BACKENDS.append("FLASHINFER")
 elif current_platform.is_rocm():
     ATTN_BACKENDS = ["TRITON_ATTN"]
 
@@ -59,6 +62,10 @@ def _allocate_and_reshape_kv_caches(
     kv_caches, just like the model runner does during initialization.
     """
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+        if kv_cache_tensor.num_blocks == 0:
+            kv_cache_tensor.num_blocks = kv_cache_config.num_blocks
 
     # Some backends (e.g. FlashAttention) query the KV cache layout during
     # reshape, which ultimately calls get_current_vllm_config(). Setting
@@ -502,3 +509,148 @@ def test_register_kv_caches_uniform_type(mock_get_layers, backend):
         assert group_refs[1] == CanonicalKVCacheRef(
             tensor_idx=1, page_size_bytes=spec_b.page_size_bytes
         )
+
+
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.offloading"
+    ".worker.get_layers_from_vllm_config"
+)
+def test_register_kv_caches_qwen_hybrid_turboquant_mixed_specs(mock_get_layers):
+    """Cover mixed packed+dense cache layouts for spec-aware canonicalization."""
+
+    class MixedShapeBackend:
+        @staticmethod
+        def get_name() -> str:
+            return "QWEN_HYBRID_TURBOQUANT"
+
+        @staticmethod
+        def get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str = "auto",
+        ) -> tuple[int, ...]:
+            return (num_blocks, block_size, num_kv_heads, 68)
+
+        @staticmethod
+        def get_kv_cache_shape_for_spec(
+            num_blocks: int,
+            kv_cache_spec,
+            cache_dtype_str: str = "auto",
+        ) -> tuple[int, ...]:
+            if isinstance(kv_cache_spec, FullAttentionSpec):
+                return (
+                    2,
+                    num_blocks,
+                    kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads,
+                    kv_cache_spec.head_size,
+                )
+            return MixedShapeBackend.get_kv_cache_shape(
+                num_blocks,
+                kv_cache_spec.block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str,
+            )
+
+    packed_layer = "model.layers.0.self_attn"
+    dense_layer = "model.layers.56.self_attn"
+
+    packed_spec = TurboQuantFullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        head_size_v=HEAD_SIZE,
+        dtype=torch.uint8,
+        mode="turbo4",
+    )
+    dense_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        head_size_v=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+
+    uniform_spec = UniformTypeKVCacheSpecs(
+        block_size=BLOCK_SIZE,
+        kv_cache_specs={
+            packed_layer: packed_spec,
+            dense_layer: dense_spec,
+        },
+    )
+
+    kv_cache_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=packed_spec.page_size_bytes * NUM_BLOCKS,
+                num_blocks=NUM_BLOCKS,
+                shared_by=[packed_layer],
+            ),
+            KVCacheTensor(
+                size=dense_spec.page_size_bytes * NUM_BLOCKS,
+                num_blocks=NUM_BLOCKS,
+                shared_by=[dense_layer],
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                layer_names=[packed_layer, dense_layer],
+                kv_cache_spec=uniform_spec,
+            )
+        ],
+    )
+
+    packed_tensor = torch.zeros(
+        (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, 68),
+        dtype=torch.uint8,
+    )
+    dense_tensor = torch.zeros(
+        (2, NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE),
+        dtype=DTYPE,
+    )
+
+    mock_get_layers.return_value = {
+        packed_layer: _make_mock_layer(MixedShapeBackend),
+        dense_layer: _make_mock_layer(MixedShapeBackend),
+    }
+
+    worker, spec = _make_worker(kv_cache_config)
+    worker.register_kv_caches(
+        {
+            packed_layer: packed_tensor,
+            dense_layer: dense_tensor,
+        }
+    )
+
+    canonical = spec.get_handlers.call_args[0][0]
+    assert isinstance(canonical, CanonicalKVCaches)
+    assert len(canonical.tensors) == 3
+
+    assert canonical.tensors[0].tensor.shape == (NUM_BLOCKS, packed_spec.page_size_bytes)
+    assert canonical.tensors[0].page_size_bytes == packed_spec.page_size_bytes
+
+    dense_half_page = dense_spec.page_size_bytes // 2
+    assert canonical.tensors[1].tensor.shape == (NUM_BLOCKS, dense_half_page)
+    assert canonical.tensors[2].tensor.shape == (NUM_BLOCKS, dense_half_page)
+    assert canonical.tensors[1].page_size_bytes == dense_half_page
+    assert canonical.tensors[2].page_size_bytes == dense_half_page
+
+    assert len(canonical.group_data_refs) == 1
+    assert canonical.group_data_refs[0] == [
+        CanonicalKVCacheRef(
+            tensor_idx=0,
+            page_size_bytes=packed_spec.page_size_bytes,
+        ),
+        CanonicalKVCacheRef(
+            tensor_idx=1,
+            page_size_bytes=dense_half_page,
+        ),
+        CanonicalKVCacheRef(
+            tensor_idx=2,
+            page_size_bytes=dense_half_page,
+        ),
+    ]

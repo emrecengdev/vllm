@@ -22,9 +22,24 @@ from vllm.triton_utils import triton
 
 logger = logging.getLogger(__name__)
 
+
+def _read_auto_bool_env(name: str, auto_value: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return auto_value
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    if normalized == "auto":
+        return auto_value
+    return auto_value
+
+
 COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
-FLA_GDN_FIX_BT = os.getenv("FLA_GDN_FIX_BT", "0") == "1"
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
@@ -149,6 +164,14 @@ is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_n
 is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in torch.cuda.get_device_name(0)
     or torch.cuda.get_device_capability()[0] >= 9
+)
+FLA_GDN_CONSERVATIVE_AUTOTUNE = _read_auto_bool_env(
+    "FLA_GDN_CONSERVATIVE_AUTOTUNE",
+    is_nvidia and not is_nvidia_hopper,
+)
+FLA_GDN_FIX_BT = _read_auto_bool_env(
+    "FLA_GDN_FIX_BT",
+    FLA_GDN_CONSERVATIVE_AUTOTUNE,
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_gather_supported = hasattr(triton.language, "gather")
