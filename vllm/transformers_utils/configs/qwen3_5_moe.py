@@ -111,7 +111,10 @@ class Qwen3_5MoeTextConfig(PretrainedConfig):
             # Transformers v4
             from transformers.configuration_utils import layer_type_validation
 
-            layer_type_validation(self.layer_types, self.num_hidden_layers)
+            try:
+                layer_type_validation(self.layer_types, self.num_hidden_layers)
+            except TypeError:
+                layer_type_validation(self.layer_types)
 
         # linear attention part
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
