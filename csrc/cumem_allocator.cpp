@@ -117,6 +117,8 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
     prop.allocFlags.gpuDirectRDMACapable = 1;
   }
   int fab_flag = 0;
+#if defined(CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED) && \
+    defined(CU_MEM_HANDLE_TYPE_FABRIC)
   CUresult fab_result = cuDeviceGetAttribute(
       &fab_flag, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, device);
   if (fab_result == CUDA_SUCCESS &&
@@ -124,11 +126,14 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
   }
 #endif
+#endif
 
 #ifndef USE_ROCM
   // Allocate memory using cuMemCreate
   CUresult ret = (CUresult)cuMemCreate(p_memHandle, size, &prop, 0);
   if (ret) {
+#if defined(CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED) && \
+    defined(CU_MEM_HANDLE_TYPE_FABRIC)
     if (fab_flag &&
         (ret == CUDA_ERROR_NOT_PERMITTED || ret == CUDA_ERROR_NOT_SUPPORTED)) {
       // Fabric allocation may fail without multi-node nvlink,
@@ -138,6 +143,9 @@ void create_and_map(unsigned long long device, ssize_t size, CUdeviceptr d_mem,
     } else {
       CUDA_CHECK(ret);
     }
+#else
+    CUDA_CHECK(ret);
+#endif
   }
   if (error_code != 0) {
     return;

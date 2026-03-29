@@ -16,11 +16,20 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.v1.kv_cache_interface import TurboQuantFullAttentionSpec
 
-from .flash_attn import FlashAttentionBackend, FlashAttentionImpl
+from .flash_attn import (
+    FlashAttentionBackend,
+    FlashAttentionImpl,
+    FlashAttentionMetadata,
+    FlashAttentionMetadataBuilder,
+    cascade_attention,
+    flash_attn_varlen_func,
+)
 
 logger = init_logger(__name__)
 
@@ -79,9 +88,40 @@ class QwenHybridTurboQuantBackend(FlashAttentionBackend):
     def get_impl_cls() -> type["FlashAttentionImpl"]:
         return QwenHybridTurboQuantImpl
 
+    @staticmethod
+    def get_builder_cls() -> type["FlashAttentionMetadataBuilder"]:
+        return FlashAttentionMetadataBuilder
+
     @classmethod
     def supports_mm_prefix(cls) -> bool:
         return True
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        config = TurboQuantRuntimeConfig.from_current_config()
+        spec = TurboQuantFullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            head_size_v=head_size,
+            dtype=torch.uint8,
+            mode=config.mode,
+        )
+        return (num_blocks, block_size, num_kv_heads, spec.bytes_per_token_per_head)
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        if include_num_layers_dimension:
+            return (0, 1, 2, 3, 4)
+        return (0, 1, 2, 3)
 
     @classmethod
     def validate_configuration(
@@ -127,9 +167,22 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
     path will eventually override KV update and cache layout handling here.
     """
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        if not isinstance(kv_cache_spec, TurboQuantFullAttentionSpec):
+            raise TypeError(
+                "QwenHybridTurboQuantImpl requires TurboQuantFullAttentionSpec."
+            )
         self.turboquant_config = TurboQuantRuntimeConfig.from_current_config()
+        self.bits = kv_cache_spec.bits
+        self.scale_dtype = torch.float16
+        self.head_size_v = kv_cache_spec.head_size_v
         if self.turboquant_config.debug_log_stats:
             logger.info(
                 "Initialized %s with mode=%s sparse_v=%s layer_adaptive=%s",
@@ -138,6 +191,179 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
                 self.turboquant_config.sparse_v,
                 self.turboquant_config.layer_adaptive,
             )
+
+    @property
+    def _quant_min(self) -> int:
+        return -(1 << (self.bits - 1))
+
+    @property
+    def _quant_max(self) -> int:
+        return (1 << (self.bits - 1)) - 1
+
+    @property
+    def _unsigned_max(self) -> int:
+        return (1 << self.bits) - 1
+
+    @property
+    def packed_k_bytes(self) -> int:
+        return TurboQuantFullAttentionSpec.packed_bytes(self.headdim, self.bits)
+
+    @property
+    def packed_v_bytes(self) -> int:
+        return TurboQuantFullAttentionSpec.packed_bytes(self.head_size_v, self.bits)
+
+    @property
+    def scale_bytes(self) -> int:
+        return torch.tensor([], dtype=self.scale_dtype).element_size()
+
+    @property
+    def bytes_per_token_per_head(self) -> int:
+        return self.packed_k_bytes + self.packed_v_bytes + 2 * self.scale_bytes
+
+    @property
+    def _value_start(self) -> int:
+        return self.packed_k_bytes
+
+    @property
+    def _k_scale_start(self) -> int:
+        return self.packed_k_bytes + self.packed_v_bytes
+
+    @property
+    def _v_scale_start(self) -> int:
+        return self._k_scale_start + self.scale_bytes
+
+    def _pad_last_dim(self, tensor: torch.Tensor, multiple: int) -> torch.Tensor:
+        pad = (-tensor.shape[-1]) % multiple
+        if pad:
+            tensor = F.pad(tensor, (0, pad))
+        return tensor
+
+    def _pack_unsigned(self, values: torch.Tensor) -> torch.Tensor:
+        values = values.to(torch.int32)
+        if self.bits == 4:
+            values = self._pad_last_dim(values, 2)
+            values = values.view(*values.shape[:-1], -1, 2)
+            packed = values[..., 0] | (values[..., 1] << 4)
+            return packed.to(torch.uint8)
+
+        values = self._pad_last_dim(values, 8)
+        values = values.view(*values.shape[:-1], -1, 8)
+        b0 = values[..., 0] | (values[..., 1] << 3) | ((values[..., 2] & 0x3) << 6)
+        b1 = (
+            ((values[..., 2] >> 2) & 0x1)
+            | (values[..., 3] << 1)
+            | (values[..., 4] << 4)
+            | ((values[..., 5] & 0x1) << 7)
+        )
+        b2 = ((values[..., 5] >> 1) & 0x3) | (values[..., 6] << 2) | (values[..., 7] << 5)
+        packed = torch.stack((b0, b1, b2), dim=-1)
+        return packed.reshape(*packed.shape[:-2], -1).to(torch.uint8)
+
+    def _unpack_unsigned(
+        self,
+        packed: torch.Tensor,
+        num_values: int,
+    ) -> torch.Tensor:
+        packed = packed.to(torch.int32)
+        if self.bits == 4:
+            lo = packed & 0x0F
+            hi = (packed >> 4) & 0x0F
+            unpacked = torch.stack((lo, hi), dim=-1).reshape(*packed.shape[:-1], -1)
+            return unpacked[..., :num_values]
+
+        packed = packed.view(*packed.shape[:-1], -1, 3)
+        b0 = packed[..., 0]
+        b1 = packed[..., 1]
+        b2 = packed[..., 2]
+        unpacked = torch.stack(
+            (
+                b0 & 0x7,
+                (b0 >> 3) & 0x7,
+                ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2),
+                (b1 >> 1) & 0x7,
+                (b1 >> 4) & 0x7,
+                ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1),
+                (b2 >> 2) & 0x7,
+                (b2 >> 5) & 0x7,
+            ),
+            dim=-1,
+        ).reshape(*packed.shape[:-2], -1)
+        return unpacked[..., :num_values]
+
+    def _quantize_tensor(
+        self,
+        tensor: torch.Tensor,
+        num_values: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_abs = tensor.abs().amax(dim=-1, keepdim=True)
+        scale = torch.where(
+            max_abs > 0,
+            max_abs / float(max(self._quant_max, 1)),
+            torch.ones_like(max_abs),
+        )
+        quantized = torch.round(tensor / scale).clamp(self._quant_min, self._quant_max)
+        unsigned = (quantized.to(torch.int32) - self._quant_min).to(torch.uint8)
+        packed = self._pack_unsigned(unsigned)
+        return packed[..., : TurboQuantFullAttentionSpec.packed_bytes(num_values, self.bits)], scale
+
+    def _encode_scale_bytes(self, scale: torch.Tensor) -> torch.Tensor:
+        return scale.to(self.scale_dtype).contiguous().view(torch.uint8)
+
+    def _decode_scale_bytes(self, scale_bytes: torch.Tensor) -> torch.Tensor:
+        return scale_bytes.contiguous().view(self.scale_dtype)
+
+    def _dequantize_tensor(
+        self,
+        packed: torch.Tensor,
+        scale_bytes: torch.Tensor,
+        num_values: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        scale = self._decode_scale_bytes(scale_bytes).to(dtype)
+        unsigned = self._unpack_unsigned(packed, num_values)
+        signed = unsigned.to(torch.int32) + self._quant_min
+        return signed.to(dtype) * scale
+
+    def _gather_local_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        valid_blocks = block_table >= 0
+        if not valid_blocks.any():
+            empty_shape = (0, kv_cache.shape[1], kv_cache.shape[2], self.headdim)
+            return (
+                torch.empty(empty_shape, dtype=dtype, device=kv_cache.device),
+                torch.empty(
+                    (0, kv_cache.shape[1], kv_cache.shape[2], self.head_size_v),
+                    dtype=dtype,
+                    device=kv_cache.device,
+                ),
+                torch.empty_like(block_table),
+            )
+
+        used_block_ids = torch.unique(block_table[valid_blocks].to(torch.int64), sorted=True)
+        local_block_table = torch.full_like(block_table, -1)
+        local_block_table[valid_blocks] = torch.searchsorted(
+            used_block_ids,
+            block_table[valid_blocks].to(torch.int64),
+        ).to(block_table.dtype)
+
+        packed_cache = kv_cache.index_select(0, used_block_ids)
+        key_cache = self._dequantize_tensor(
+            packed_cache[..., : self.packed_k_bytes],
+            packed_cache[..., self._k_scale_start : self._k_scale_start + self.scale_bytes],
+            self.headdim,
+            dtype,
+        ).contiguous()
+        value_cache = self._dequantize_tensor(
+            packed_cache[..., self._value_start : self._value_start + self.packed_v_bytes],
+            packed_cache[..., self._v_scale_start : self._v_scale_start + self.scale_bytes],
+            self.head_size_v,
+            dtype,
+        ).contiguous()
+        return key_cache, value_cache, local_block_table
 
     def forward(
         self,
@@ -151,14 +377,136 @@ class QwenHybridTurboQuantImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return super().forward(
-            layer=layer,
-            query=query,
-            key=key,
-            value=value,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-            output=output,
-            output_scale=output_scale,
-            output_block_scale=output_block_scale,
+        assert output is not None, "Output tensor must be provided."
+        assert self.vllm_flash_attn_version is not None, (
+            "FlashAttention version not detected."
         )
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "fused output quantization is not supported for TurboQuant backend"
+            )
+        if attn_metadata is None:
+            return output.fill_(0)
+        if self.dcp_world_size > 1:
+            raise NotImplementedError(
+                "TurboQuant backend does not yet support decode context parallelism."
+            )
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        key_cache, value_cache, local_block_table = self._gather_local_kv_cache(
+            kv_cache,
+            attn_metadata.block_table,
+            query.dtype,
+        )
+        descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, self.num_kv_heads)
+        q_descale = layer._q_scale.expand(descale_shape)
+        k_descale = layer._k_scale.expand(descale_shape)
+        v_descale = layer._v_scale.expand(descale_shape)
+
+        if not attn_metadata.use_cascade:
+            sliding_window_size = (
+                list(self.sliding_window) if self.sliding_window is not None else None
+            )
+            flash_attn_varlen_func(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=local_block_table,
+                softcap=self.logits_soft_cap,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
+                fa_version=self.vllm_flash_attn_version,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
+            return output
+
+        cascade_attention(
+            output[:num_actual_tokens],
+            query[:num_actual_tokens],
+            key_cache,
+            value_cache,
+            cu_query_lens=attn_metadata.query_start_loc,
+            max_query_len=attn_metadata.max_query_len,
+            cu_prefix_query_lens=attn_metadata.cu_prefix_query_lens,
+            prefix_kv_lens=attn_metadata.prefix_kv_lens,
+            suffix_kv_lens=attn_metadata.suffix_kv_lens,
+            max_kv_len=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            alibi_slopes=self.alibi_slopes,
+            sliding_window=self.sliding_window,
+            logits_soft_cap=self.logits_soft_cap,
+            block_table=local_block_table,
+            common_prefix_len=attn_metadata.common_prefix_len,
+            max_num_splits=attn_metadata.max_num_splits,
+            fa_version=self.vllm_flash_attn_version,
+            prefix_scheduler_metadata=attn_metadata.prefix_scheduler_metadata,
+            suffix_scheduler_metadata=attn_metadata.scheduler_metadata,
+            q_descale=layer._q_scale,
+            k_descale=layer._k_scale,
+            v_descale=layer._v_scale,
+            s_aux=self.sinks,
+        )
+        return output
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        if slot_mapping.numel() == 0:
+            return
+        valid = slot_mapping >= 0
+        if not valid.any():
+            return
+
+        key = key[: slot_mapping.shape[0]][valid]
+        value = value[: slot_mapping.shape[0]][valid]
+        slots = slot_mapping[valid].to(torch.int64)
+        block_size = kv_cache.shape[1]
+        block_ids = torch.div(slots, block_size, rounding_mode="floor")
+        block_offsets = torch.remainder(slots, block_size)
+
+        packed_k, k_scale = self._quantize_tensor(key, self.headdim)
+        packed_v, v_scale = self._quantize_tensor(value, self.head_size_v)
+        k_scale_bytes = self._encode_scale_bytes(k_scale)
+        v_scale_bytes = self._encode_scale_bytes(v_scale)
+
+        kv_cache[
+            block_ids,
+            block_offsets,
+            :,
+            : self.packed_k_bytes,
+        ] = packed_k
+        kv_cache[
+            block_ids,
+            block_offsets,
+            :,
+            self._value_start : self._value_start + self.packed_v_bytes,
+        ] = packed_v
+        kv_cache[
+            block_ids,
+            block_offsets,
+            :,
+            self._k_scale_start : self._k_scale_start + self.scale_bytes,
+        ] = k_scale_bytes
+        kv_cache[
+            block_ids,
+            block_offsets,
+            :,
+            self._v_scale_start : self._v_scale_start + self.scale_bytes,
+        ] = v_scale_bytes

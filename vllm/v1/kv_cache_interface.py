@@ -188,6 +188,80 @@ class FullAttentionSpec(AttentionSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class TurboQuantFullAttentionSpec(FullAttentionSpec):
+    mode: str = "turbo4"
+    scale_dtype: torch.dtype = torch.float16
+
+    @property
+    def bits(self) -> int:
+        if self.mode == "turbo4":
+            return 4
+        if self.mode == "turbo3":
+            return 3
+        raise ValueError(f"Unsupported TurboQuant mode: {self.mode}")
+
+    @staticmethod
+    def packed_bytes(num_values: int, bits: int) -> int:
+        return cdiv(num_values * bits, 8)
+
+    @property
+    def packed_k_bytes(self) -> int:
+        return self.packed_bytes(self.head_size, self.bits)
+
+    @property
+    def packed_v_bytes(self) -> int:
+        return self.packed_bytes(self.head_size_v, self.bits)
+
+    @property
+    def scale_bytes(self) -> int:
+        return get_dtype_size(self.scale_dtype)
+
+    @property
+    def bytes_per_token_per_head(self) -> int:
+        return self.packed_k_bytes + self.packed_v_bytes + 2 * self.scale_bytes
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.block_size * self.num_kv_heads * self.bytes_per_token_per_head
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, TurboQuantFullAttentionSpec) for spec in specs), (
+            "All layers in the same KV cache group must be TurboQuantFullAttentionSpec."
+        )
+        merged_spec = cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            head_size_v=specs[0].head_size_v,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+            sliding_window=specs[0].sliding_window,
+            attention_chunk_size=specs[0].attention_chunk_size,
+            mode=specs[0].mode,
+            scale_dtype=specs[0].scale_dtype,
+        )
+        for spec in specs:
+            for name in (
+                "block_size",
+                "num_kv_heads",
+                "head_size",
+                "head_size_v",
+                "dtype",
+                "page_size_padded",
+                "sliding_window",
+                "attention_chunk_size",
+                "mode",
+                "scale_dtype",
+            ):
+                assert getattr(spec, name) == getattr(merged_spec, name), (
+                    "All layers in the same KV cache group must have the same "
+                    "TurboQuant attention spec."
+                )
+        return merged_spec
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
@@ -403,6 +477,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
             # Different block sizes, not uniform.
             return False
         one_spec = next(iter(kv_cache_specs.values()))
+        if isinstance(one_spec, TurboQuantFullAttentionSpec):
+            return all(
+                isinstance(spec, TurboQuantFullAttentionSpec)
+                and spec.mode == one_spec.mode
+                and spec.scale_dtype == one_spec.scale_dtype
+                for spec in kv_cache_specs.values()
+            )
         if isinstance(one_spec, FullAttentionSpec):
             return all(
                 isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()

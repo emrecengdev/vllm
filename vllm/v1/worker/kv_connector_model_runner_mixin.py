@@ -22,7 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheConfig,
+    TurboQuantFullAttentionSpec,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
@@ -173,6 +177,8 @@ class KVConnectorModelRunnerMixin:
         attn_group = attn_groups[0][0]
         kv_cache_spec = attn_group.kv_cache_spec
         if not isinstance(kv_cache_spec, AttentionSpec):
+            return False
+        if isinstance(kv_cache_spec, TurboQuantFullAttentionSpec):
             return False
 
         attn_backend = attn_group.backend

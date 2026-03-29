@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    TurboQuantFullAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -551,6 +552,18 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
             )
         else:
+            if (
+                vllm_config.attention_config.turboquant_enabled
+                and self.attn_backend.get_name() == "QWEN_HYBRID_TURBOQUANT"
+            ):
+                return TurboQuantFullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=torch.uint8,
+                    mode=vllm_config.attention_config.turboquant_mode,
+                )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
